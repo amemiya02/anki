@@ -619,6 +619,70 @@ async fn upload_download(ctx: &SyncTestContext) -> Result<()> {
     Ok(())
 }
 
+// Hayaki: RWKV scheduling switch
+/////////////////////
+
+/// The switch is a collection config key: it follows the collection, and a
+/// preset saved on another device does not erase it.
+#[tokio::test]
+async fn hayaki_rwkv_switch_follows_the_collection() -> Result<()> {
+    use crate::scheduler::rwkv::CONFIG_KEY;
+    with_active_server(|client| async move {
+        let ctx = SyncTestContext::new(client);
+        upload_download(&ctx).await?;
+        let mut col1 = ctx.col1();
+        let mut col2 = ctx.col2();
+
+        col1.set_config_json(CONFIG_KEY, &true, false)?;
+        ctx.normal_sync(&mut col1).await;
+        ctx.normal_sync(&mut col2).await;
+        assert!(col2.rwkv_enabled());
+
+        // Another device saves a preset; the switch survives the round trip.
+        // Sync compares modification times in whole seconds.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let mut conf = col2.get_deck_config(DeckConfigId(1), false)?.unwrap();
+        conf.inner.new_per_day = 33;
+        // A transaction bumps the collection's modification time, as the apps do.
+        col2.transact_no_undo(|col| col.add_or_update_deck_config(&mut conf))?;
+        ctx.normal_sync(&mut col2).await;
+        ctx.normal_sync(&mut col1).await;
+        assert!(col1.rwkv_enabled());
+        assert_eq!(
+            col1.get_deck_config(DeckConfigId(1), false)?.unwrap().inner.new_per_day,
+            33
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// Config syncs as a whole map from the newer collection. A device that
+/// changed any config after the switch was turned on elsewhere, and syncs
+/// last, turns the switch back. The help text beside the switch says so.
+#[tokio::test]
+async fn hayaki_rwkv_switch_is_last_writer_wins() -> Result<()> {
+    use crate::scheduler::rwkv::CONFIG_KEY;
+    with_active_server(|client| async move {
+        let ctx = SyncTestContext::new(client);
+        upload_download(&ctx).await?;
+        let mut col1 = ctx.col1();
+        let mut col2 = ctx.col2();
+
+        col1.set_config_json(CONFIG_KEY, &true, false)?;
+        ctx.normal_sync(&mut col1).await;
+        // col2 changes another preference before it has synced the switch.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        col2.set_config_json("hayakiTestKey", &1, false)?;
+        ctx.normal_sync(&mut col2).await;
+        ctx.normal_sync(&mut col1).await;
+        assert!(!col1.rwkv_enabled());
+        assert!(!col2.rwkv_enabled());
+        Ok(())
+    })
+    .await
+}
+
 // Regular syncs
 /////////////////////
 

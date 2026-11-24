@@ -228,3 +228,63 @@ fn a_reopened_collection_restores_the_snapshot() {
     assert_eq!(col.rwkv_status().1, Status::Ready);
     assert_eq!(scores(&mut col), expected);
 }
+
+/// Answering writes the same card and revlog with the switch on as off, so
+/// unpatched Anki always sees an ordinary collection.
+#[test]
+fn answering_writes_the_same_rows_with_the_switch_on() {
+    let Some(_) = weights() else {
+        println!("HAYAKI_RWKV_WEIGHTS not set; skipping");
+        return;
+    };
+    let answer_first_card = |col: &mut Collection| {
+        let card = col
+            .storage
+            .get_all_cards()
+            .into_iter()
+            .min_by_key(|c| c.id)
+            .unwrap();
+        let states = col.get_scheduling_states(card.id).unwrap();
+        col.answer_card(&mut crate::scheduler::answering::CardAnswer {
+            card_id: card.id,
+            current_state: states.current,
+            new_state: states.good,
+            rating: crate::scheduler::answering::Rating::Good,
+            answered_at: TimestampMillis(1_000),
+            milliseconds_taken: 3_000,
+            custom_data: None,
+            from_queue: true,
+        })
+        .unwrap();
+        let card = col.storage.get_card(card.id).unwrap().unwrap();
+        let revlog = col.storage.get_revlog_entries_for_card(card.id).unwrap();
+        let last = revlog.into_iter().max_by_key(|r| r.id).unwrap();
+        (
+            (
+                card.due,
+                card.interval,
+                card.ease_factor,
+                card.reps,
+                card.lapses,
+                card.queue,
+                card.ctype,
+            ),
+            card.memory_state
+                .map(|m| (m.stability.to_bits(), m.difficulty.to_bits())),
+            (
+                last.button_chosen,
+                last.interval,
+                last.last_interval,
+                last.ease_factor,
+                last.review_kind,
+            ),
+        )
+    };
+
+    let mut off = collection_with_history();
+    let mut on = collection_with_history();
+    assert!(prepared(&mut on));
+    // Build the RWKV queue first, so answering runs with it in place.
+    let _ = review_queue(&mut on);
+    assert_eq!(answer_first_card(&mut on), answer_first_card(&mut off));
+}
