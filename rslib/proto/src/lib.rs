@@ -38,4 +38,4 @@ protobuf!(sync, "sync");
 protobuf!(tags, "tags");
 protobuf!(ankihub, "ankihub");
 protobuf!(github, "github");
-protobuf!(hayaki, "hayaki");
+protobuf!(zz_hayaki, "zz_hayaki");

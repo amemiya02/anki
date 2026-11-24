@@ -6,9 +6,9 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anki_proto::hayaki::rwkv_status_response::State;
-use anki_proto::hayaki::PrepareRwkvRequest;
-use anki_proto::hayaki::RwkvStatusResponse;
+use anki_proto::zz_hayaki::rwkv_status_response::State;
+use anki_proto::zz_hayaki::PrepareRwkvRequest;
+use anki_proto::zz_hayaki::RwkvStatusResponse;
 use fushi_rwkv::Model;
 use sha2::Digest;
 

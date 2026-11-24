@@ -8,7 +8,9 @@ syntax = "proto3";
 
 option java_multiple_files = true;
 
-package anki.hayaki;
+// The package matches the file name, as Anki's TypeScript and Python
+// generators derive import paths from it.
+package anki.zz_hayaki;
 
 import "anki/generic.proto";
 
