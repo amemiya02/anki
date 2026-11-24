@@ -57,22 +57,28 @@ pub(crate) struct Mappings {
 
 impl Mappings {
     pub fn load(col: &Collection) -> Result<Self> {
-        let cards = col
-            .storage
+        Ok(Self {
+            cards: Self::load_cards(col)?,
+            deck_presets: Self::load_deck_presets(col)?,
+        })
+    }
+
+    pub fn load_cards(col: &Collection) -> Result<HashMap<i64, (i64, i64)>> {
+        col.storage
             .db
             .prepare("select id, nid, case when odid != 0 then odid else did end from cards")?
             .query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?
-            .collect::<std::result::Result<_, _>>()?;
-        let deck_presets = col
+            .collect::<std::result::Result<_, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn load_deck_presets(col: &Collection) -> Result<HashMap<i64, i64>> {
+        Ok(col
             .storage
             .get_all_decks()?
             .into_iter()
             .filter_map(|deck| Some((deck.id.0, deck.config_id()?.0)))
-            .collect();
-        Ok(Self {
-            cards,
-            deck_presets,
-        })
+            .collect())
     }
 
     pub fn preset_for_deck(&self, deck_id: i64) -> i64 {

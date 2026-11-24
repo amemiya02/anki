@@ -183,6 +183,8 @@ impl Collection {
     }
 
     pub fn close(self, desired_version: Option<SchemaVersion>) -> Result<()> {
+        // Hayaki: keep the RWKV state for the next open, and stop its threads.
+        self.state.rwkv.lock().unwrap().on_close();
         self.storage.close(desired_version)
     }
 

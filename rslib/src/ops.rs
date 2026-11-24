@@ -176,8 +176,6 @@ impl OpChanges {
                         | Op::UpdatePreferences
                         | Op::UpdateDeckConfig
                         | Op::ToggleLoadBalancer
-                        // Hayaki: the RWKV scheduling switch is a config key.
-                        | Op::UpdateConfig
                 ))
             || c.deck_config
     }

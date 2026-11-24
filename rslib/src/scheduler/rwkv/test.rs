@@ -224,9 +224,89 @@ fn a_reopened_collection_restores_the_snapshot() {
         .build()
         .unwrap();
     col.rwkv_prepare(model).unwrap();
-    // Restored from the snapshot: ready at once, without a replay.
-    assert_eq!(col.rwkv_status().1, Status::Ready);
+    // Restoring a snapshot reports no replay progress.
+    assert_eq!(col.rwkv_status().1, Status::Preparing { done: 0, total: 0 });
+    wait_ready(&col);
     assert_eq!(scores(&mut col), expected);
+}
+
+fn is_replaying(col: &Collection) -> bool {
+    matches!(col.rwkv_status().1, Status::Preparing { total, .. } if total > 0)
+}
+
+/// A sync can bring a card moved on another device with a modification time
+/// older than local ones; the changed sync time still finds it.
+#[test]
+fn a_synced_move_with_an_old_modification_time_replays_in_full() {
+    let mut col = collection_with_history();
+    if !prepared(&mut col) {
+        return;
+    }
+    let other = col.get_or_create_normal_deck("Other").unwrap();
+    let card = col
+        .storage
+        .get_all_cards()
+        .into_iter()
+        .min_by_key(|c| c.id)
+        .unwrap();
+    col.storage
+        .db
+        .execute(
+            "update cards set did = ?, mod = 1 where id = ?",
+            [other.id.0, card.id.0],
+        )
+        .unwrap();
+    col.storage.set_last_sync(TimestampMillis::now()).unwrap();
+    assert!(col.rwkv_due_review_cards(false).unwrap().is_none());
+    assert!(is_replaying(&col));
+    wait_ready(&col);
+}
+
+/// A deletion and an addition that leave the card count unchanged are still
+/// found, through the deletion's grave.
+#[test]
+fn a_deletion_hidden_by_an_addition_replays_in_full() {
+    let mut col = collection_with_history();
+    if !prepared(&mut col) {
+        return;
+    }
+    let card = col
+        .storage
+        .get_all_cards()
+        .into_iter()
+        .min_by_key(|c| c.id)
+        .unwrap();
+    col.remove_notes(&[card.note_id]).unwrap();
+    let nt = col.get_notetype_by_name("Basic").unwrap().unwrap();
+    let mut note = nt.new_note();
+    note.set_field(0, "replacement").unwrap();
+    col.add_note(&mut note, DeckId(1)).unwrap();
+    assert!(col.rwkv_due_review_cards(false).unwrap().is_none());
+    assert!(is_replaying(&col));
+    wait_ready(&col);
+}
+
+/// Undoing a change the model does not replay, such as Set Due Date, is
+/// followed without a full replay.
+#[test]
+fn undoing_a_set_due_date_needs_no_replay() {
+    let mut col = collection_with_history();
+    if !prepared(&mut col) {
+        return;
+    }
+    let before = scores(&mut col);
+    let card = col
+        .storage
+        .get_all_cards()
+        .into_iter()
+        .min_by_key(|c| c.id)
+        .unwrap();
+    col.set_due_date(&[card.id], "5", None).unwrap();
+    assert!(col.rwkv_due_review_cards(false).unwrap().is_some());
+    col.undo().unwrap();
+    assert!(col.rwkv_due_review_cards(false).unwrap().is_some());
+    assert!(!is_replaying(&col));
+    assert_eq!(scores(&mut col), before);
 }
 
 /// Answering writes the same card and revlog with the switch on as off, so

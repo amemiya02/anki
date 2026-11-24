@@ -22,6 +22,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use fushi_rwkv::Model;
 use fushi_rwkv::ReviewInput;
@@ -58,7 +59,12 @@ const MIN_INTERVENING_REVIEWS: u64 = 5;
 /// every answer moves the deck, preset and collection streams.
 const REQUERY_EVERY_ANSWERS: u32 = 20;
 const REPLAY_CHUNK: usize = 8_192;
-const SNAPSHOT_MAGIC: &[u8; 8] = b"HYKRWKV1";
+const SNAPSHOT_MAGIC: &[u8; 8] = b"HYKRWKV2";
+/// Undo history kept for catch-up, like the runtime's own journal (about
+/// 600 entries).
+const JOURNAL_CAP: usize = 512;
+/// A failed engine prepares again after this long.
+const RETRY_FAILED_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum Status {
@@ -72,25 +78,20 @@ pub enum Status {
     Failed(String),
 }
 
-/// What the runtime has replayed, so changes to the revlog can be applied
-/// incrementally.
+/// What the runtime has replayed, so changes to the collection can be
+/// applied incrementally.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Replayed {
-    revlog_count: u64,
-    revlog_max_id: i64,
     /// Kept rows replayed so far, across the whole timeline.
     rows: u64,
     cards: HashMap<i64, CardHistory>,
     mappings: Mappings,
-    cards_max_mod: i64,
-    cards_count: u64,
-    decks_max_mtime: i64,
+    signature: Signature,
     /// The time of day the scheduling day starts, in seconds. Day indexes
     /// depend on it, so a change replays in full.
-    #[serde(default)]
     rollover_secs: i64,
-    /// Rows appended through the runtime's undo journal, oldest first, with the
-    /// card's history before each.
+    /// Revlog rows seen since the last full replay or restore, oldest first,
+    /// so undoing them can be followed. Capped like the runtime's own journal.
     #[serde(skip)]
     journal: Vec<JournalEntry>,
 }
@@ -98,6 +99,13 @@ struct Replayed {
 #[derive(Debug, Clone)]
 struct JournalEntry {
     review_id: i64,
+    /// Set for rows appended to the runtime. Rows the model does not replay
+    /// (rescheduling, set due date) are kept too, so undoing them is followed.
+    appended: Option<Appended>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Appended {
     card_id: i64,
     previous: Option<CardHistory>,
 }
@@ -113,6 +121,7 @@ struct Score {
 #[derive(Default)]
 pub struct Engine {
     status: Status,
+    failed_at: Option<Instant>,
     model: Option<Model>,
     runtime: Option<RwkvRuntime>,
     replayed: Replayed,
@@ -121,6 +130,8 @@ pub struct Engine {
     /// Bumped whenever the engine becomes ready or replays in full, so cached
     /// study queues built under another state are rebuilt.
     pub(crate) epoch: u64,
+    /// Bumped when a replay or restore starts and when the collection closes,
+    /// so a thread working for an older state discards its result.
     replay_generation: u64,
     snapshot_path: Option<PathBuf>,
 }
@@ -164,38 +175,41 @@ struct ReplayInput {
     signature: Signature,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What catch-up compares to decide whether anything changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Signature {
     revlog_count: u64,
     revlog_max_id: i64,
     cards_max_mod: i64,
     cards_count: u64,
-    decks_max_mtime: i64,
+    /// Local deletions write graves until the next sync.
+    graves_count: u64,
+    /// A sync can bring cards with modification times older than local ones,
+    /// so a changed sync time compares every card.
+    last_sync: i64,
 }
 
 impl Signature {
     fn read(col: &Collection) -> Result<Self> {
-        let (revlog_count, revlog_max_id) = col.storage.db.query_row(
+        let db = &col.storage.db;
+        let (revlog_count, revlog_max_id) = db.query_row(
             "select count(), coalesce(max(id), 0) from revlog",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let (cards_count, cards_max_mod) = col.storage.db.query_row(
+        let (cards_count, cards_max_mod) = db.query_row(
             "select count(), coalesce(max(mod), 0) from cards",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let decks_max_mtime = col.storage.db.query_row(
-            "select max((select coalesce(max(mtime_secs), 0) from decks), (select coalesce(max(mtime_secs), 0) from deck_config))",
-            [],
-            |row| row.get(0),
-        )?;
+        let graves_count = db.query_row("select count() from graves", [], |row| row.get(0))?;
         Ok(Self {
             revlog_count,
             revlog_max_id,
             cards_max_mod,
             cards_count,
-            decks_max_mtime,
+            graves_count,
+            last_sync: col.storage.get_collection_timestamps()?.last_sync.0,
         })
     }
 }
@@ -209,17 +223,22 @@ impl Engine {
         self.status == Status::Ready && self.runtime.is_some()
     }
 
-    fn record_signature(&mut self, signature: Signature) {
-        let r = &mut self.replayed;
-        r.revlog_count = signature.revlog_count;
-        r.revlog_max_id = signature.revlog_max_id;
-        r.cards_max_mod = signature.cards_max_mod;
-        r.cards_count = signature.cards_count;
-        r.decks_max_mtime = signature.decks_max_mtime;
+    fn fail(&mut self, message: String) {
+        self.status = Status::Failed(message);
+        self.failed_at = Some(Instant::now());
+        self.runtime = None;
+        self.epoch += 1;
     }
 
-    /// Appends one kept row through the journal. Returns false if the runtime
-    /// refused it, which the caller answers with a full replay.
+    fn push_journal(&mut self, entry: JournalEntry) {
+        self.replayed.journal.push(entry);
+        if self.replayed.journal.len() > JOURNAL_CAP {
+            self.replayed.journal.remove(0);
+        }
+    }
+
+    /// Appends one kept row through the runtime's journal. Returns false if
+    /// the runtime refused it, which the caller answers with a full replay.
     fn append(&mut self, row: &KeptRow, timing: &SchedTimingToday) -> bool {
         let Some(runtime) = self.runtime.as_mut() else {
             return false;
@@ -235,10 +254,12 @@ impl Engine {
         }
         self.replayed.rows += 1;
         self.replayed.cards.insert(row.card_id, history);
-        self.replayed.journal.push(JournalEntry {
+        self.push_journal(JournalEntry {
             review_id: row.review_id,
-            card_id: row.card_id,
-            previous,
+            appended: Some(Appended {
+                card_id: row.card_id,
+                previous,
+            }),
         });
         self.forget_note_scores(row.note_id);
         self.answers_since_requery += 1;
@@ -246,32 +267,34 @@ impl Engine {
     }
 
     /// Undoes the newest journal entry if it is `review_id`.
-    fn unappend(&mut self, review_id: i64) -> bool {
+    fn undo_newest(&mut self, review_id: i64) -> bool {
         let Some(entry) = self.replayed.journal.last().cloned() else {
             return false;
         };
         if entry.review_id != review_id {
             return false;
         }
-        let Some(runtime) = self.runtime.as_mut() else {
-            return false;
-        };
-        if !matches!(runtime.unappend(review_id as u64), Ok(true)) {
-            return false;
+        if let Some(appended) = entry.appended {
+            let Some(runtime) = self.runtime.as_mut() else {
+                return false;
+            };
+            if !matches!(runtime.unappend(review_id as u64), Ok(true)) {
+                return false;
+            }
+            self.replayed.rows -= 1;
+            let note_id = self
+                .replayed
+                .cards
+                .get(&appended.card_id)
+                .map(|h| h.note_id)
+                .unwrap_or_default();
+            match appended.previous {
+                Some(previous) => self.replayed.cards.insert(appended.card_id, previous),
+                None => self.replayed.cards.remove(&appended.card_id),
+            };
+            self.forget_note_scores(note_id);
         }
         self.replayed.journal.pop();
-        self.replayed.rows -= 1;
-        let note_id = self
-            .replayed
-            .cards
-            .get(&entry.card_id)
-            .map(|h| h.note_id)
-            .unwrap_or_default();
-        match entry.previous {
-            Some(previous) => self.replayed.cards.insert(entry.card_id, previous),
-            None => self.replayed.cards.remove(&entry.card_id),
-        };
-        self.forget_note_scores(note_id);
         true
     }
 
@@ -279,66 +302,118 @@ impl Engine {
         self.scores.retain(|_, score| score.note_id != note_id);
     }
 
-    fn write_snapshot(&self) {
-        let (Some(path), Some(runtime)) = (&self.snapshot_path, &self.runtime) else {
-            return;
-        };
-        let Ok(state) = runtime.snapshot() else {
-            return;
-        };
-        let Ok(replayed) = serde_json::to_vec(&self.replayed) else {
-            return;
-        };
-        let mut bytes = Vec::with_capacity(16 + replayed.len() + state.len());
+    /// The snapshot file's contents, taken under the lock. Writing happens
+    /// outside it.
+    fn snapshot_bytes(&self) -> Option<(PathBuf, Vec<u8>)> {
+        let path = self.snapshot_path.clone()?;
+        let state = self.runtime.as_ref()?.snapshot().ok()?;
+        let replayed = serde_json::to_vec(&self.replayed).ok()?;
+        let mut bytes = Vec::with_capacity(80 + replayed.len() + state.len());
         bytes.extend_from_slice(SNAPSHOT_MAGIC);
+        bytes.extend_from_slice(WEIGHTS_SHA256.as_bytes());
         bytes.extend_from_slice(&(replayed.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&replayed);
         bytes.extend_from_slice(&state);
-        let tmp = path.with_extension("rwkv.tmp");
-        if std::fs::write(&tmp, &bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
-        }
+        Some((path, bytes))
     }
 
     fn read_snapshot(path: &Path, model: &Model) -> Option<(Replayed, RwkvRuntime)> {
         let bytes = std::fs::read(path).ok()?;
-        if bytes.len() < 16 || &bytes[..8] != SNAPSHOT_MAGIC {
+        let header = SNAPSHOT_MAGIC.len() + WEIGHTS_SHA256.len();
+        if bytes.len() < header + 8
+            || &bytes[..SNAPSHOT_MAGIC.len()] != SNAPSHOT_MAGIC
+            || &bytes[SNAPSHOT_MAGIC.len()..header] != WEIGHTS_SHA256.as_bytes()
+        {
             return None;
         }
-        let len = u64::from_le_bytes(bytes[8..16].try_into().ok()?) as usize;
-        let replayed: Replayed = serde_json::from_slice(bytes.get(16..16 + len)?).ok()?;
+        let len = u64::from_le_bytes(bytes[header..header + 8].try_into().ok()?) as usize;
+        let body = header + 8;
+        let replayed: Replayed = serde_json::from_slice(bytes.get(body..body + len)?).ok()?;
         let mut runtime = RwkvRuntime::new(model, StatePrecision::Int4, 0).ok()?;
-        runtime.restore(bytes.get(16 + len..)?).ok()?;
+        runtime.restore(bytes.get(body + len..)?).ok()?;
         Some((replayed, runtime))
+    }
+
+    /// Called when the collection closes: keeps the current state for the
+    /// next open, and stops any replay thread from installing or writing.
+    pub(crate) fn on_close(&mut self) {
+        self.replay_generation += 1;
+        if self.is_ready() {
+            if let Some((path, bytes)) = self.snapshot_bytes() {
+                write_snapshot_file(&path, &bytes);
+            }
+        }
+    }
+}
+
+fn write_snapshot_file(path: &Path, bytes: &[u8]) {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp = path.with_extension(format!("rwkv.{}.{nanos}.tmp", std::process::id()));
+    if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
 /// Replays `input` into a fresh runtime off the collection thread, then
-/// installs it if no newer replay has started meanwhile.
+/// installs it if no newer replay has started and the collection is open.
 fn spawn_full_replay(shared: SharedEngine, model: Model, input: ReplayInput, generation: u64) {
     std::thread::spawn(move || {
         let result = full_replay(&shared, &model, &input, generation);
+        let snapshot = {
+            let mut engine = shared.lock().unwrap();
+            if engine.replay_generation != generation {
+                return;
+            }
+            match result {
+                Ok((runtime, mut replayed)) => {
+                    replayed.signature = input.signature;
+                    engine.runtime = Some(runtime);
+                    engine.replayed = replayed;
+                    engine.scores.clear();
+                    engine.answers_since_requery = 0;
+                    engine.status = Status::Ready;
+                    engine.epoch += 1;
+                    engine.snapshot_bytes()
+                }
+                Err(message) => {
+                    engine.fail(message);
+                    None
+                }
+            }
+        };
+        if let Some((path, bytes)) = snapshot {
+            write_snapshot_file(&path, &bytes);
+        }
+    });
+}
+
+/// Restores the snapshot off the collection thread. If it cannot be read, it
+/// is removed and the engine goes back to not prepared, so the next
+/// preparation replays in full.
+fn spawn_restore(shared: SharedEngine, model: Model, path: PathBuf, generation: u64) {
+    std::thread::spawn(move || {
+        let restored = Engine::read_snapshot(&path, &model);
         let mut engine = shared.lock().unwrap();
         if engine.replay_generation != generation {
             return;
         }
-        match result {
-            Ok((runtime, replayed)) => {
+        match restored {
+            Some((replayed, runtime)) => {
                 engine.runtime = Some(runtime);
                 engine.replayed = replayed;
-                engine.record_signature(input.signature);
                 engine.scores.clear();
                 engine.answers_since_requery = 0;
                 engine.status = Status::Ready;
-                engine.epoch += 1;
-                engine.write_snapshot();
             }
-            Err(message) => {
-                engine.runtime = None;
-                engine.status = Status::Failed(message);
-                engine.epoch += 1;
+            None => {
+                let _ = std::fs::remove_file(&path);
+                engine.status = Status::NotPrepared;
             }
         }
+        engine.epoch += 1;
     });
 }
 
@@ -398,6 +473,16 @@ impl Collection {
             .unwrap_or(false)
     }
 
+    /// True when the queue is built by the RWKV rule right now.
+    pub(crate) fn rwkv_in_use(&self) -> bool {
+        self.rwkv_enabled()
+            && self
+                .state
+                .rwkv
+                .try_lock()
+                .is_ok_and(|engine| engine.is_ready())
+    }
+
     fn rwkv_snapshot_path(&self) -> PathBuf {
         self.col_path.with_extension("rwkv")
     }
@@ -408,42 +493,30 @@ impl Collection {
     }
 
     /// Installs the model, then restores the snapshot or starts a full
-    /// replay in the background. Safe to call again; a ready engine is kept.
+    /// replay, both in the background. Safe to call again; a ready or
+    /// preparing engine is kept.
     pub fn rwkv_prepare(&mut self, model: Model) -> Result<()> {
         let shared = self.state.rwkv.clone();
         // An in-memory collection (tests) has no file to keep a snapshot beside.
         let snapshot_path = self.col_path.is_file().then(|| self.rwkv_snapshot_path());
+        let mut engine = shared.lock().unwrap();
+        engine.snapshot_path = snapshot_path.clone();
+        if engine.is_ready()
+            || (matches!(engine.status, Status::Preparing { .. }) && engine.model.is_some())
         {
-            let mut engine = shared.lock().unwrap();
-            engine.snapshot_path = snapshot_path.clone();
-            if engine.is_ready() {
-                return Ok(());
-            }
-            if matches!(engine.status, Status::Preparing { .. }) && engine.model.is_some() {
-                return Ok(());
-            }
-            if let Some((replayed, runtime)) = snapshot_path
-                .as_deref()
-                .and_then(|path| Engine::read_snapshot(path, &model))
-            {
-                engine.model = Some(model);
-                engine.runtime = Some(runtime);
-                engine.replayed = replayed;
-                engine.status = Status::Ready;
-                engine.epoch += 1;
-                drop(engine);
-                // Bring the restored state up to date now; this falls back to a
-                // full replay when the collection changed in ways the snapshot
-                // cannot follow.
-                let timing = self.timing_today()?;
-                let mut engine = shared.lock().unwrap();
-                self.rwkv_catch_up(&shared, &mut engine, &timing)?;
-                return Ok(());
-            }
-            engine.model = Some(model);
+            return Ok(());
+        }
+        engine.model = Some(model.clone());
+        engine.failed_at = None;
+        if let Some(path) = snapshot_path.filter(|path| path.exists()) {
+            engine.replay_generation += 1;
+            engine.runtime = None;
+            engine.status = Status::Preparing { done: 0, total: 0 };
+            engine.epoch += 1;
+            spawn_restore(shared.clone(), model, path, engine.replay_generation);
+            return Ok(());
         }
         let timing = self.timing_today()?;
-        let mut engine = shared.lock().unwrap();
         self.rwkv_start_full_replay(&shared, &mut engine, &timing)
     }
 
@@ -488,20 +561,14 @@ impl Collection {
             return Ok(CatchUp::NotReady);
         }
         let signature = Signature::read(self)?;
-        let r = &engine.replayed;
-        if signature.revlog_count == r.revlog_count
-            && signature.revlog_max_id == r.revlog_max_id
-            && signature.cards_max_mod == r.cards_max_mod
-            && signature.cards_count == r.cards_count
-            && signature.decks_max_mtime == r.decks_max_mtime
-        {
+        if signature == engine.replayed.signature {
             return Ok(CatchUp::Ready);
         }
         if !self.rwkv_apply_changes(engine, &signature, timing)? {
             self.rwkv_start_full_replay(shared, engine, timing)?;
             return Ok(CatchUp::NotReady);
         }
-        engine.record_signature(signature);
+        engine.replayed.signature = signature;
         Ok(CatchUp::Ready)
     }
 
@@ -513,79 +580,83 @@ impl Collection {
         signature: &Signature,
         timing: &SchedTimingToday,
     ) -> Result<bool> {
-        // Cards, decks and presets. A changed note, home deck or preset of a
-        // replayed card, or a deleted card, changes replayed features.
-        if signature.cards_count < engine.replayed.cards_count {
+        let old = engine.replayed.signature;
+
+        // Presets: decks are few, so every catch-up compares them.
+        let deck_presets = Mappings::load_deck_presets(self)?;
+        engine.replayed.mappings.deck_presets = deck_presets;
+        let mappings = &engine.replayed.mappings;
+        if engine
+            .replayed
+            .cards
+            .values()
+            .any(|h| mappings.preset_for_deck(h.home_deck_id) != h.preset_id)
+        {
             return Ok(false);
         }
-        let changed_cards: Vec<(i64, i64, i64)> = self
-            .storage
-            .db
-            .prepare(
-                "select id, nid, case when odid != 0 then odid else did end from cards where mod > ?",
-            )?
-            .query_map([engine.replayed.cards_max_mod], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })?
-            .collect::<std::result::Result<_, _>>()?;
-        for (card, note, deck) in changed_cards {
-            if let Some(history) = engine.replayed.cards.get(&card) {
-                if history.note_id != note || history.home_deck_id != deck {
-                    return Ok(false);
+
+        // Cards. A sync, a deletion or a count change compares every card;
+        // otherwise local changes are found by modification time.
+        if signature.last_sync != old.last_sync
+            || signature.graves_count != old.graves_count
+            || signature.cards_count != old.cards_count
+        {
+            let cards = Mappings::load_cards(self)?;
+            for (card, history) in &engine.replayed.cards {
+                match cards.get(card) {
+                    Some(&(note, deck))
+                        if note == history.note_id && deck == history.home_deck_id => {}
+                    _ => return Ok(false),
                 }
             }
-            engine.replayed.mappings.cards.insert(card, (note, deck));
-        }
-        if signature.decks_max_mtime != engine.replayed.decks_max_mtime {
-            let fresh = Mappings::load(self)?;
-            let used_decks: HashSet<i64> = engine
-                .replayed
-                .cards
-                .values()
-                .map(|h| h.home_deck_id)
-                .collect();
-            for deck in used_decks {
-                if fresh.preset_for_deck(deck) != engine.replayed.mappings.preset_for_deck(deck) {
-                    return Ok(false);
+            engine.replayed.mappings.cards = cards;
+        } else if signature.cards_max_mod != old.cards_max_mod {
+            let changed: Vec<(i64, i64, i64)> = self
+                .storage
+                .db
+                .prepare(
+                    "select id, nid, case when odid != 0 then odid else did end from cards where mod > ?",
+                )?
+                .query_map([old.cards_max_mod], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            for (card, note, deck) in changed {
+                if let Some(history) = engine.replayed.cards.get(&card) {
+                    if history.note_id != note || history.home_deck_id != deck {
+                        return Ok(false);
+                    }
                 }
+                engine.replayed.mappings.cards.insert(card, (note, deck));
             }
-            engine.replayed.mappings.deck_presets = fresh.deck_presets;
         }
 
         // Revlog rows removed: only an undo of the newest journal entries can
         // be followed.
-        let mut known_count = engine.replayed.revlog_count;
-        let mut known_max = engine.replayed.revlog_max_id;
+        let mut known_count = old.revlog_count;
+        let mut known_max = old.revlog_max_id;
         if signature.revlog_max_id < known_max || signature.revlog_count < known_count {
-            let present: HashSet<i64> = {
-                let ids: Vec<i64> = engine
-                    .replayed
-                    .journal
-                    .iter()
-                    .map(|e| e.review_id)
-                    .collect();
-                if ids.is_empty() {
-                    return Ok(false);
-                }
-                let mut sql = String::from("select id from revlog where id in (");
-                sql.push_str(
-                    &ids.iter()
-                        .map(|i| i.to_string())
-                        .collect::<Vec<_>>()
-                        .join(","),
-                );
-                sql.push(')');
-                self.storage
-                    .db
-                    .prepare(&sql)?
-                    .query_map([], |row| row.get(0))?
-                    .collect::<std::result::Result<_, _>>()?
-            };
+            if engine.replayed.journal.is_empty() {
+                return Ok(false);
+            }
+            let ids = engine
+                .replayed
+                .journal
+                .iter()
+                .map(|e| e.review_id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let present: HashSet<i64> = self
+                .storage
+                .db
+                .prepare(&format!("select id from revlog where id in ({ids})"))?
+                .query_map([], |row| row.get(0))?
+                .collect::<std::result::Result<_, _>>()?;
             while let Some(entry) = engine.replayed.journal.last().cloned() {
                 if present.contains(&entry.review_id) {
                     break;
                 }
-                if !engine.unappend(entry.review_id) {
+                if !engine.undo_newest(entry.review_id) {
                     return Ok(false);
                 }
                 known_count -= 1;
@@ -615,18 +686,18 @@ impl Collection {
             if row.is_forget_marker() && engine.replayed.cards.contains_key(&row.card_id) {
                 return Ok(false);
             }
-            if !row.is_replayable() {
-                continue;
-            }
-            let Some(&(note_id, home_deck_id)) = engine.replayed.mappings.cards.get(&row.card_id)
-            else {
+            let mapping = engine.replayed.mappings.cards.get(&row.card_id).copied();
+            let (Some((note_id, home_deck_id)), true) = (mapping, row.is_replayable()) else {
+                engine.push_journal(JournalEntry {
+                    review_id: row.id,
+                    appended: None,
+                });
                 continue;
             };
-            if let Some(history) = engine.replayed.cards.get(&row.card_id) {
-                // A new learning sequence drops the card's earlier reviews.
-                if row.kind == 0 && history.last_kind != 0 {
-                    return Ok(false);
-                }
+            let previous_kind = engine.replayed.cards.get(&row.card_id).map(|h| h.last_kind);
+            // A new learning sequence drops the card's earlier reviews.
+            if row.kind == 0 && previous_kind.is_some_and(|kind| kind != 0) {
+                return Ok(false);
             }
             let kept = KeptRow {
                 review_id: row.id,
@@ -637,12 +708,7 @@ impl Collection {
                 ease: row.ease,
                 duration_millis: row.duration_millis,
                 review_kind: row.kind,
-                is_learning_start: row.kind == 0
-                    && engine
-                        .replayed
-                        .cards
-                        .get(&row.card_id)
-                        .is_none_or(|h| h.last_kind != 0),
+                is_learning_start: row.kind == 0 && previous_kind.is_none(),
             };
             if !engine.append(&kept, timing) {
                 return Ok(false);
@@ -662,10 +728,14 @@ impl Collection {
             return Ok(None);
         }
         let shared = self.state.rwkv.clone();
-        let not_prepared = shared
-            .try_lock()
-            .is_ok_and(|engine| engine.status == Status::NotPrepared);
-        if not_prepared {
+        let needs_preparing = shared.try_lock().is_ok_and(|engine| match engine.status {
+            Status::NotPrepared => true,
+            Status::Failed(_) => engine
+                .failed_at
+                .is_none_or(|at| at.elapsed() >= RETRY_FAILED_AFTER),
+            _ => false,
+        });
+        if needs_preparing {
             if let Some(model) = loaded_model() {
                 self.rwkv_prepare(model)?;
             }
@@ -680,18 +750,14 @@ impl Collection {
             Ok(CatchUp::Ready) => {}
             Ok(CatchUp::NotReady) => return Ok(None),
             Err(err) => {
-                engine.status = Status::Failed(err.to_string());
-                engine.runtime = None;
-                engine.epoch += 1;
+                engine.fail(err.to_string());
                 return Ok(None);
             }
         }
         match func(self, &mut engine, &timing) {
             Ok(value) => Ok(Some(value)),
             Err(err) => {
-                engine.status = Status::Failed(err.to_string());
-                engine.runtime = None;
-                engine.epoch += 1;
+                engine.fail(err.to_string());
                 Ok(None)
             }
         }
