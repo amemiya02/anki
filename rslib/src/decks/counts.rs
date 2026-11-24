@@ -35,7 +35,37 @@ impl Collection {
         days_elapsed: u32,
         learn_cutoff: u32,
     ) -> Result<HashMap<DeckId, DueCounts>> {
-        self.storage.due_counts(days_elapsed, learn_cutoff)
+        let mut counts = self.storage.due_counts(days_elapsed, learn_cutoff)?;
+        // Hayaki: with RWKV scheduling on and ready, a normal deck's review
+        // count is the number of its cards the RWKV rule queues. Filtered
+        // decks keep upstream's count.
+        if let Some(rwkv) = self.rwkv_review_counts_by_deck()? {
+            let decks = self.storage.get_decks_map()?;
+            for (deck_id, deck) in &decks {
+                if deck.is_filtered() {
+                    continue;
+                }
+                let review = rwkv.get(deck_id).copied().unwrap_or(0);
+                match counts.get_mut(deck_id) {
+                    Some(entry) => entry.review = review,
+                    None if review > 0 => {
+                        counts.insert(
+                            *deck_id,
+                            DueCounts {
+                                new: 0,
+                                review,
+                                learning: 0,
+                                intraday_learning: 0,
+                                interday_learning: 0,
+                                total_cards: 0,
+                            },
+                        );
+                    }
+                    None => {}
+                }
+            }
+        }
+        Ok(counts)
     }
 
     pub(crate) fn counts_for_deck_today(

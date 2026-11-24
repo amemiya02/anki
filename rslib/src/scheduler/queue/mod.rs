@@ -245,6 +245,12 @@ impl Collection {
     pub(crate) fn get_queues(&mut self) -> Result<&mut CardQueues> {
         let deck = self.get_current_deck()?;
         self.clear_queues_if_day_changed()?;
+        // Hayaki: rebuild when RWKV became ready, replayed, or was switched.
+        if let Some(epoch) = self.rwkv_epoch() {
+            if epoch != self.state.rwkv_queue_epoch {
+                self.clear_study_queues();
+            }
+        }
         if self.state.card_queues.is_none() {
             self.state.card_queues = Some(self.build_queues(deck.id)?);
         }

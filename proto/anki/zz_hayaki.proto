@@ -1,0 +1,43 @@
+// Copyright: Ankitects Pty Ltd and contributors
+// License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
+
+// Hayaki additions. The file name sorts after every upstream proto file, so
+// upstream's service and method numbers do not move.
+
+syntax = "proto3";
+
+option java_multiple_files = true;
+
+package anki.hayaki;
+
+import "anki/generic.proto";
+
+service HayakiService {}
+
+service BackendHayakiService {
+  // RWKV scheduling (Hayaki ADR-0009): whether the switch is on and whether
+  // the model is ready.
+  rpc RwkvStatus(generic.Empty) returns (RwkvStatusResponse);
+  // Downloads the model weights into weights_dir if they are missing, loads
+  // them, and starts preparing the open collection in the background.
+  // Returns once preparation has started; poll RwkvStatus for progress.
+  rpc PrepareRwkv(PrepareRwkvRequest) returns (RwkvStatusResponse);
+}
+
+message PrepareRwkvRequest {
+  string weights_dir = 1;
+}
+
+message RwkvStatusResponse {
+  enum State {
+    NOT_PREPARED = 0;
+    PREPARING = 1;
+    READY = 2;
+    FAILED = 3;
+  }
+  bool enabled = 1;
+  State state = 2;
+  uint64 done = 3;
+  uint64 total = 4;
+  string error = 5;
+}

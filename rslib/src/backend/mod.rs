@@ -11,6 +11,7 @@ mod config;
 pub(crate) mod dbproxy;
 mod error;
 mod github;
+mod hayaki;
 mod i18n;
 mod import_export;
 mod media;

@@ -42,6 +42,8 @@ reqwest = { workspace = true, features = ["native-tls"] }
 wiremock.workspace = true
 
 [dependencies]
+# Hayaki: RWKV review queue (scheduler/rwkv).
+fushi_rwkv = { path = "fushi_rwkv" }
 criterion = { workspace = true, optional = true }
 
 ammonia.workspace = true

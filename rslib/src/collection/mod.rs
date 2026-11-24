@@ -138,6 +138,10 @@ pub struct CollectionState {
     /// identical backups.
     pub(crate) last_backup_modified: Option<TimestampMillis>,
     pub(crate) progress: Arc<Mutex<ProgressState>>,
+    /// Hayaki: the RWKV model state, and the engine epoch the study queues
+    /// were built under.
+    pub(crate) rwkv: crate::scheduler::rwkv::SharedEngine,
+    pub(crate) rwkv_queue_epoch: u64,
 }
 
 pub struct Collection {

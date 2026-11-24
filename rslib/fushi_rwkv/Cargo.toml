@@ -1,0 +1,16 @@
+[package]
+name = "fushi_rwkv"
+version = "0.1.0"
+edition = "2021"
+publish = false
+# Vendored from Fushi (https://github.com/hajisensai/Fushi), native/fushi_rwkv at
+# commit 07940eaef04a871fb3d89457b320abfe6ae2b752. Its inference core comes from
+# kuma3-anki-core's rslib/src/rwkv; see UPSTREAM-FUSHI.md and README.md.
+license = "AGPL-3.0-or-later"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+half = "2.6.0"
+rayon.workspace = true

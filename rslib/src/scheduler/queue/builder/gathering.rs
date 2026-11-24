@@ -14,7 +14,10 @@ impl QueueBuilder {
     pub(super) fn gather_cards(&mut self, col: &mut Collection) -> Result<()> {
         self.gather_intraday_learning_cards(col)?;
         self.gather_due_cards(col, DueCardKind::Learning)?;
-        self.gather_due_cards(col, DueCardKind::Review)?;
+        match self.rwkv_reviews.take() {
+            Some(rwkv_reviews) => self.gather_rwkv_review_cards(col, rwkv_reviews)?,
+            None => self.gather_due_cards(col, DueCardKind::Review)?,
+        }
         self.gather_new_cards(col)?;
 
         Ok(())
@@ -58,6 +61,52 @@ impl QueueBuilder {
                 Ok(true)
             },
         )
+    }
+
+    /// Hayaki: home-deck reviews come from the RWKV rule, already sorted.
+    /// Reviews in filtered decks keep upstream's rule.
+    fn gather_rwkv_review_cards(
+        &mut self,
+        col: &mut Collection,
+        rwkv_reviews: Vec<DueCard>,
+    ) -> Result<()> {
+        for card in rwkv_reviews {
+            if !self.add_due_card_within_limits(card)? {
+                return Ok(());
+            }
+        }
+        if self.limits.root_limit_reached(LimitKind::Review) {
+            return Ok(());
+        }
+        col.storage.for_each_due_card_in_active_decks(
+            self.context.timing,
+            self.context.sort_options.review_order,
+            DueCardKind::Review,
+            self.context.fsrs,
+            |card| {
+                if card.original_deck_id.0 == 0 {
+                    return Ok(true);
+                }
+                self.add_due_card_within_limits(card)
+            },
+        )
+    }
+
+    /// Adds a due card unless a limit is reached. Returns false once the root
+    /// limit is reached.
+    fn add_due_card_within_limits(&mut self, card: DueCard) -> Result<bool> {
+        if self.limits.root_limit_reached(LimitKind::Review) {
+            return Ok(false);
+        }
+        if !self
+            .limits
+            .limit_reached(card.current_deck_id, LimitKind::Review)?
+            && self.add_due_card(card)
+        {
+            self.limits
+                .decrement_deck_and_parent_limits(card.current_deck_id, LimitKind::Review)?;
+        }
+        Ok(true)
     }
 
     fn gather_new_cards(&mut self, col: &mut Collection) -> Result<()> {

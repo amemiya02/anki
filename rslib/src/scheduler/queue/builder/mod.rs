@@ -111,6 +111,9 @@ pub(super) struct QueueBuilder {
     limits: LimitTreeMap,
     load_balancer: Option<LoadBalancer>,
     context: Context,
+    /// Hayaki: home-deck review cards chosen by the RWKV rule, lowest recall
+    /// first. None when RWKV scheduling is off or not ready.
+    pub(super) rwkv_reviews: Option<Vec<DueCard>>,
 }
 
 /// Data container and helper for building queues.
@@ -172,6 +175,7 @@ impl QueueBuilder {
             day_learning: Vec::new(),
             limits,
             load_balancer,
+            rwkv_reviews: None,
             context: Context {
                 timing,
                 config_map,
@@ -289,6 +293,15 @@ impl Collection {
         let mut queues = QueueBuilder::new(self, deck_id)?;
         self.storage
             .update_active_decks(&queues.context.root_deck)?;
+
+        // Hayaki: record the RWKV epoch these queues are built under, then pick
+        // home-deck reviews by the RWKV rule when it is on and ready.
+        if let Some(epoch) = self.rwkv_epoch() {
+            self.state.rwkv_queue_epoch = epoch;
+        }
+        queues.rwkv_reviews = self
+            .rwkv_due_review_cards(true)?
+            .map(|cards| cards.into_iter().map(|c| c.card).collect());
 
         queues.gather_cards(self)?;
 

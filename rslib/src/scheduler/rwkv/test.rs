@@ -1,0 +1,195 @@
+// Copyright: Ankitects Pty Ltd and contributors
+// License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
+
+//! Tests that need the model read its weights from the file named by
+//! HAYAKI_RWKV_WEIGHTS and are skipped when it is unset, so the suite runs
+//! without network access.
+
+use std::time::Duration;
+use std::time::Instant;
+
+use super::*;
+use crate::card::CardType;
+use crate::scheduler::queue::QueueEntryKind;
+
+fn weights() -> Option<Model> {
+    let path = std::env::var("HAYAKI_RWKV_WEIGHTS").ok()?;
+    Some(Model::from_bytes(&std::fs::read(path).unwrap()).unwrap())
+}
+
+const CARDS: i64 = 40;
+
+/// A collection whose cards are all review cards with two months of history.
+/// Some cards are due by their stored date and some are not.
+fn collection_with_history() -> Collection {
+    let mut col = Collection::new();
+    let nt = col.get_notetype_by_name("Basic").unwrap().unwrap();
+    let deck = col.get_or_create_normal_deck("Default").unwrap();
+    let now = TimestampSecs::now().0;
+    let mut cards = vec![];
+    for i in 0..CARDS {
+        let mut note = nt.new_note();
+        note.set_field(0, format!("front {i}")).unwrap();
+        col.add_note(&mut note, deck.id).unwrap();
+        let mut card = col
+            .storage
+            .get_card_by_ordinal(note.id, 0)
+            .unwrap()
+            .unwrap();
+        let days = [60, 59 - i % 5, 50 - i % 9, 30 - i % 11, 12 - i % 7];
+        for (n, days_ago) in days.iter().enumerate() {
+            let id = (now - days_ago * 86_400 - 3_600) * 1000 + i;
+            let (kind, ease) = if n == 0 {
+                (0, 3)
+            } else {
+                (1, if (i + n as i64) % 6 == 0 { 1 } else { 3 })
+            };
+            col.storage
+                .db
+                .execute(
+                    "insert into revlog (id, cid, usn, ease, ivl, lastIvl, factor, time, type) values (?, ?, 0, ?, 5, 3, 2500, 4000, ?)",
+                    [id, card.id.0, ease, kind],
+                )
+                .unwrap();
+        }
+        let today = col.timing_today().unwrap().days_elapsed as i32;
+        card.ctype = CardType::Review;
+        card.queue = CardQueue::Review;
+        card.interval = 10;
+        card.due = today + (i as i32 % 9) - 4;
+        cards.push(card);
+    }
+    col.update_cards_maybe_undoable(cards, false).unwrap();
+    col
+}
+
+fn review_queue(col: &mut Collection) -> Vec<CardId> {
+    col.clear_study_queues();
+    col.get_queued_cards(1000, false)
+        .unwrap()
+        .cards
+        .into_iter()
+        .filter(|c| c.kind == QueueEntryKind::Review)
+        .map(|c| c.card.id)
+        .collect()
+}
+
+fn set_switch(col: &mut Collection, on: bool) {
+    col.set_config_json(CONFIG_KEY, &on, false).unwrap();
+}
+
+fn wait_ready(col: &Collection) {
+    let started = Instant::now();
+    loop {
+        match col.rwkv_status().1 {
+            Status::Ready => return,
+            Status::Failed(err) => panic!("RWKV failed: {err}"),
+            _ if started.elapsed() > Duration::from_secs(60) => panic!("RWKV not ready"),
+            _ => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+
+fn prepared(col: &mut Collection) -> bool {
+    let Some(model) = weights() else {
+        println!("HAYAKI_RWKV_WEIGHTS not set; skipping");
+        return false;
+    };
+    set_switch(col, true);
+    col.rwkv_prepare(model).unwrap();
+    wait_ready(col);
+    true
+}
+
+fn scores(col: &mut Collection) -> Vec<(CardId, u32)> {
+    col.rwkv_due_review_cards(false)
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .map(|c| (c.card.id, c.retrievability.to_bits()))
+        .collect()
+}
+
+#[test]
+fn switch_on_without_a_ready_model_keeps_the_upstream_queue() {
+    let mut col = collection_with_history();
+    let upstream = review_queue(&mut col);
+    assert!(!upstream.is_empty());
+    set_switch(&mut col, true);
+    assert_eq!(col.rwkv_status().1, Status::NotPrepared);
+    assert_eq!(review_queue(&mut col), upstream);
+    set_switch(&mut col, false);
+    assert_eq!(review_queue(&mut col), upstream);
+}
+
+#[test]
+fn queue_follows_recall_and_deck_counts_agree() {
+    let mut col = collection_with_history();
+    let upstream = review_queue(&mut col);
+    if !prepared(&mut col) {
+        return;
+    }
+    let due = col.rwkv_due_review_cards(false).unwrap().unwrap();
+    let expected: Vec<CardId> = due.iter().map(|c| c.card.id).collect();
+    assert!(due
+        .windows(2)
+        .all(|w| w[0].retrievability <= w[1].retrievability));
+    assert!(due.iter().all(|c| c.retrievability <= 0.9));
+    let queue = review_queue(&mut col);
+    assert_eq!(queue, expected);
+    assert_ne!(
+        queue, upstream,
+        "the RWKV rule should differ from due dates here"
+    );
+
+    let tree = col.deck_tree(Some(TimestampSecs::now())).unwrap();
+    let default = tree.children.iter().find(|d| d.name == "Default").unwrap();
+    assert_eq!(default.review_count as usize, queue.len());
+
+    // Turning the switch off returns to the stored due dates at once.
+    set_switch(&mut col, false);
+    assert_eq!(review_queue(&mut col), upstream);
+}
+
+#[test]
+fn undo_restores_every_prediction() {
+    let mut col = collection_with_history();
+    if !prepared(&mut col) {
+        return;
+    }
+    let before = scores(&mut col);
+    let rows_before = col.state.rwkv.lock().unwrap().replayed.rows;
+    let answered = col.answer_good().card_id;
+    let after_answer = scores(&mut col);
+    assert_eq!(
+        col.state.rwkv.lock().unwrap().replayed.rows,
+        rows_before + 1
+    );
+    assert_ne!(before, after_answer);
+    // The answered card waits for the same-day guard.
+    assert!(!review_queue(&mut col).contains(&answered));
+
+    col.undo().unwrap();
+    let after_undo = scores(&mut col);
+    assert_eq!(col.state.rwkv.lock().unwrap().replayed.rows, rows_before);
+    assert_eq!(before, after_undo);
+
+    // Redo appends the same review again and gives the same predictions.
+    col.redo().unwrap();
+    assert_eq!(scores(&mut col), after_answer);
+}
+
+#[test]
+fn history_changes_force_a_full_replay() {
+    let mut col = collection_with_history();
+    if !prepared(&mut col) {
+        return;
+    }
+    let first = col.storage.get_all_cards().into_iter().next().unwrap();
+    let other = col.get_or_create_normal_deck("Other").unwrap();
+    col.set_deck(&[first.id], other.id).unwrap();
+    // The move changes a replayed card's home deck, so the engine replays.
+    assert!(col.rwkv_due_review_cards(false).unwrap().is_none());
+    wait_ready(&col);
+    assert!(col.rwkv_due_review_cards(false).unwrap().is_some());
+}

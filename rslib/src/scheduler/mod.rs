@@ -14,6 +14,8 @@ pub mod fsrs;
 pub mod new;
 pub(crate) mod queue;
 mod reviews;
+/// Hayaki: opt-in RWKV review queue.
+pub mod rwkv;
 mod service;
 pub mod states;
 pub mod timespan;
