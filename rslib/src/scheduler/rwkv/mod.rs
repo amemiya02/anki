@@ -85,6 +85,10 @@ struct Replayed {
     cards_max_mod: i64,
     cards_count: u64,
     decks_max_mtime: i64,
+    /// The time of day the scheduling day starts, in seconds. Day indexes
+    /// depend on it, so a change replays in full.
+    #[serde(default)]
+    rollover_secs: i64,
     /// Rows appended through the runtime's undo journal, oldest first, with the
     /// card's history before each.
     #[serde(skip)]
@@ -350,6 +354,7 @@ fn full_replay(
         RwkvRuntime::new(model, StatePrecision::Int4, 0).map_err(|e| e.to_string())?;
     let mut replayed = Replayed {
         mappings: input.mappings.clone(),
+        rollover_secs: input.timing.next_day_at.0.rem_euclid(86_400),
         ..Default::default()
     };
     let mut inputs: Vec<ReviewInput> = Vec::with_capacity(REPLAY_CHUNK);
@@ -476,6 +481,10 @@ impl Collection {
         timing: &SchedTimingToday,
     ) -> Result<CatchUp> {
         if !engine.is_ready() {
+            return Ok(CatchUp::NotReady);
+        }
+        if timing.next_day_at.0.rem_euclid(86_400) != engine.replayed.rollover_secs {
+            self.rwkv_start_full_replay(shared, engine, timing)?;
             return Ok(CatchUp::NotReady);
         }
         let signature = Signature::read(self)?;

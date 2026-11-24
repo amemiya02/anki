@@ -335,3 +335,18 @@ fn only_home_deck_reviews_follow_the_rwkv_rule() {
     );
     assert_eq!(queue_of(&mut col, DeckId(1), QueueEntryKind::New), new_off);
 }
+
+#[test]
+fn changing_the_day_rollover_replays_in_full() {
+    let mut col = collection_with_history();
+    if !prepared(&mut col) {
+        return;
+    }
+    let mut prefs = col.get_preferences().unwrap();
+    let scheduling = prefs.scheduling.as_mut().unwrap();
+    scheduling.rollover = (scheduling.rollover + 1) % 24;
+    col.set_preferences(prefs).unwrap();
+    assert!(col.rwkv_due_review_cards(false).unwrap().is_none());
+    wait_ready(&col);
+    assert!(col.rwkv_due_review_cards(false).unwrap().is_some());
+}
