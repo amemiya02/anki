@@ -193,3 +193,38 @@ fn history_changes_force_a_full_replay() {
     wait_ready(&col);
     assert!(col.rwkv_due_review_cards(false).unwrap().is_some());
 }
+
+#[test]
+fn a_reopened_collection_restores_the_snapshot() {
+    let Some(model) = weights() else {
+        println!("HAYAKI_RWKV_WEIGHTS not set; skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("collection.anki2");
+    let expected = {
+        // Write the in-memory fixture to a file-backed collection.
+        collection_with_history()
+            .storage
+            .db
+            .execute(&format!("vacuum into '{}'", path.display()), [])
+            .unwrap();
+        let mut col = crate::collection::CollectionBuilder::new(&path)
+            .build()
+            .unwrap();
+        set_switch(&mut col, true);
+        col.rwkv_prepare(model.clone()).unwrap();
+        wait_ready(&col);
+        let expected = scores(&mut col);
+        col.close(None).unwrap();
+        expected
+    };
+    assert!(path.with_extension("rwkv").exists());
+    let mut col = crate::collection::CollectionBuilder::new(&path)
+        .build()
+        .unwrap();
+    col.rwkv_prepare(model).unwrap();
+    // Restored from the snapshot: ready at once, without a replay.
+    assert_eq!(col.rwkv_status().1, Status::Ready);
+    assert_eq!(scores(&mut col), expected);
+}

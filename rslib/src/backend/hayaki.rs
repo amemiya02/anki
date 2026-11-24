@@ -95,3 +95,30 @@ impl BackendHayakiService for Backend {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_weights_of_the_wrong_size_or_hash() {
+        assert!(!weights_are_valid(b"not weights"));
+        assert!(!weights_are_valid(&vec![0u8; rwkv::WEIGHTS_LEN]));
+    }
+
+    #[test]
+    fn downloads_and_verifies_the_pinned_weights() -> Result<()> {
+        if std::env::var("ONLINE_TESTS").is_err() {
+            println!("test disabled; ONLINE_TESTS not set");
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let backend = Backend::new(I18n::template_only(), false);
+        let bytes = backend.rwkv_weights(dir.path())?;
+        assert!(weights_are_valid(&bytes));
+        assert!(Model::from_bytes(&bytes).is_ok());
+        // The second call reads the file instead of downloading.
+        assert_eq!(backend.rwkv_weights(dir.path())?, bytes);
+        Ok(())
+    }
+}
