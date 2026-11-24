@@ -473,16 +473,6 @@ impl Collection {
             .unwrap_or(false)
     }
 
-    /// True when the queue is built by the RWKV rule right now.
-    pub(crate) fn rwkv_in_use(&self) -> bool {
-        self.rwkv_enabled()
-            && self
-                .state
-                .rwkv
-                .try_lock()
-                .is_ok_and(|engine| engine.is_ready())
-    }
-
     fn rwkv_snapshot_path(&self) -> PathBuf {
         self.col_path.with_extension("rwkv")
     }
@@ -597,9 +587,14 @@ impl Collection {
 
         // Cards. A sync, a deletion or a count change compares every card;
         // otherwise local changes are found by modification time.
+        // An undo writes a card back with its old modification time, so a
+        // lower maximum, or removed revlog rows, also compares every card.
         if signature.last_sync != old.last_sync
             || signature.graves_count != old.graves_count
             || signature.cards_count != old.cards_count
+            || signature.cards_max_mod < old.cards_max_mod
+            || signature.revlog_count < old.revlog_count
+            || signature.revlog_max_id < old.revlog_max_id
         {
             let cards = Mappings::load_cards(self)?;
             for (card, history) in &engine.replayed.cards {

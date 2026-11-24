@@ -302,6 +302,7 @@ impl Collection {
         queues.rwkv_reviews = self
             .rwkv_due_review_cards(true)?
             .map(|cards| cards.into_iter().map(|c| c.card).collect());
+        self.state.rwkv_built_queue = queues.rwkv_reviews.is_some();
 
         queues.gather_cards(self)?;
 

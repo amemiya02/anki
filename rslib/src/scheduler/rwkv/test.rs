@@ -430,3 +430,30 @@ fn changing_the_day_rollover_replays_in_full() {
     wait_ready(&col);
     assert!(col.rwkv_due_review_cards(false).unwrap().is_some());
 }
+
+/// Undo writes a card back with its old modification time; moving a card
+/// and undoing the move still leaves the model with the card's real deck.
+#[test]
+fn undoing_a_deck_move_is_noticed() {
+    let mut col = collection_with_history();
+    if !prepared(&mut col) {
+        return;
+    }
+    let other = col.get_or_create_normal_deck("Other").unwrap();
+    let card = col
+        .storage
+        .get_all_cards()
+        .into_iter()
+        .min_by_key(|c| c.id)
+        .unwrap();
+    col.set_deck(&[card.id], other.id).unwrap();
+    assert!(col.rwkv_due_review_cards(false).unwrap().is_none());
+    wait_ready(&col);
+    assert!(col.rwkv_due_review_cards(false).unwrap().is_some());
+    col.undo().unwrap();
+    assert!(col.rwkv_due_review_cards(false).unwrap().is_none());
+    assert!(is_replaying(&col));
+    wait_ready(&col);
+    let home = col.state.rwkv.lock().unwrap().replayed.cards[&card.id.0].home_deck_id;
+    assert_eq!(home, card.deck_id.0);
+}

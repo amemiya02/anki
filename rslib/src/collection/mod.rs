@@ -142,6 +142,8 @@ pub struct CollectionState {
     /// were built under.
     pub(crate) rwkv: crate::scheduler::rwkv::SharedEngine,
     pub(crate) rwkv_queue_epoch: u64,
+    /// Whether the current study queues took their reviews from RWKV.
+    pub(crate) rwkv_built_queue: bool,
 }
 
 pub struct Collection {
