@@ -288,3 +288,50 @@ fn answering_writes_the_same_rows_with_the_switch_on() {
     let _ = review_queue(&mut on);
     assert_eq!(answer_first_card(&mut on), answer_first_card(&mut off));
 }
+
+#[test]
+fn the_same_day_guard_needs_both_time_and_other_answers() {
+    assert!(!same_day_guard_passes(4, 600));
+    assert!(!same_day_guard_passes(50, 29));
+    assert!(same_day_guard_passes(5, 30));
+}
+
+/// Filtered decks, new cards and learning cards keep upstream's rule.
+#[test]
+fn only_home_deck_reviews_follow_the_rwkv_rule() {
+    let mut col = collection_with_history();
+    // A new card, and a filtered deck holding some of the review cards.
+    let nt = col.get_notetype_by_name("Basic").unwrap().unwrap();
+    let mut note = nt.new_note();
+    note.set_field(0, "new").unwrap();
+    col.add_note(&mut note, DeckId(1)).unwrap();
+    let mut filtered = col.get_or_create_filtered_deck(DeckId(0)).unwrap();
+    filtered.human_name = "Filtered".into();
+    filtered.config.search_terms[0].search = "deck:Default is:review".into();
+    filtered.config.search_terms[0].limit = 20;
+    col.add_or_update_filtered_deck(filtered).unwrap();
+    let filtered_id = col.get_deck_id("Filtered").unwrap().unwrap();
+
+    let queue_of = |col: &mut Collection, deck: DeckId, kind: QueueEntryKind| -> Vec<CardId> {
+        col.set_current_deck(deck).unwrap();
+        col.clear_study_queues();
+        col.get_queued_cards(1000, false)
+            .unwrap()
+            .cards
+            .into_iter()
+            .filter(|c| c.kind == kind)
+            .map(|c| c.card.id)
+            .collect()
+    };
+    let filtered_off = queue_of(&mut col, filtered_id, QueueEntryKind::Review);
+    let new_off = queue_of(&mut col, DeckId(1), QueueEntryKind::New);
+    if !prepared(&mut col) {
+        return;
+    }
+    assert!(!filtered_off.is_empty());
+    assert_eq!(
+        queue_of(&mut col, filtered_id, QueueEntryKind::Review),
+        filtered_off
+    );
+    assert_eq!(queue_of(&mut col, DeckId(1), QueueEntryKind::New), new_off);
+}

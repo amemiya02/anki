@@ -375,6 +375,12 @@ fn full_replay(
     Ok((runtime, replayed))
 }
 
+/// A card answered today comes back only after [MIN_ELAPSED_SECS] and
+/// [MIN_INTERVENING_REVIEWS] other answers.
+fn same_day_guard_passes(intervening_reviews: u64, elapsed_secs: i64) -> bool {
+    intervening_reviews >= MIN_INTERVENING_REVIEWS && elapsed_secs >= MIN_ELAPSED_SECS
+}
+
 /// What [Collection::rwkv_catch_up] found.
 enum CatchUp {
     Ready,
@@ -776,7 +782,7 @@ impl Collection {
             if last.last_review_id >= day_start_ms {
                 let intervening = engine.replayed.rows.saturating_sub(last.last_index + 1);
                 let elapsed = (now_ms - last.last_review_id) / 1000;
-                if intervening < MIN_INTERVENING_REVIEWS || elapsed < MIN_ELAPSED_SECS {
+                if !same_day_guard_passes(intervening, elapsed) {
                     continue;
                 }
                 now_queries.push((card, history::query_input(card.id.0, &last, today, now_ms)));
