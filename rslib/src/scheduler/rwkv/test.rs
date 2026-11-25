@@ -588,10 +588,7 @@ fn choosing_a_model_during_a_replay_drops_that_replay() {
     // The superseded small replay never installs its runtime.
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(col.rwkv_status().2, Status::Ready);
-    assert_eq!(
-        col.state.rwkv.lock().unwrap().size(),
-        Some(ModelSize::Tiny)
-    );
+    assert_eq!(col.state.rwkv.lock().unwrap().size(), Some(ModelSize::Tiny));
 }
 
 #[test]

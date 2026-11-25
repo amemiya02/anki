@@ -2255,7 +2255,11 @@ fn write_u32(out: &mut Vec<u8>, value: u32) {
 }
 
 fn state_cache_optional_i64_len(value: Option<i64>) -> usize {
-    if value.is_some() { 9 } else { 1 }
+    if value.is_some() {
+        9
+    } else {
+        1
+    }
 }
 
 fn state_cache_i64_set_len(count: usize) -> usize {
@@ -5009,11 +5013,9 @@ fn bonus_gate_in_place(
     v: &[f32],
     g: &[f32],
 ) {
-    assert!(
-        [&*output, r, bonus, k, v, g]
-            .iter()
-            .all(|values| values.len() == D_MODEL)
-    );
+    assert!([&*output, r, bonus, k, v, g]
+        .iter()
+        .all(|values| values.len() == D_MODEL));
 
     #[cfg(target_arch = "aarch64")]
     // SAFETY: aarch64 guarantees NEON support, and every length was checked

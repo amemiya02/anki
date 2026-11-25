@@ -33,9 +33,9 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::ffi::{CString, c_char};
+use std::ffi::{c_char, CString};
 use std::io;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 // 上游在 `cfg(test)` 下额外编译 aarch64/macOS 的批量查询路径（给它自己的对拍测试用），
 // 本 crate 的测试在 tests/ 里、不调用它们，x86 上的 lib test 构建就只剩 dead_code 告警。
@@ -46,10 +46,10 @@ mod curve;
 #[allow(clippy::let_and_return, clippy::manual_is_multiple_of)]
 mod rwkv;
 
-pub use curve::{AnswerCurve, answer_intervals};
+pub use curve::{answer_intervals, AnswerCurve};
 pub use rwkv::small::{SmallHeads, SmallInference, SmallModel, SmallUndo};
 pub use rwkv::{
-    ReviewInput, RwkvInference, RwkvModel, RwkvStats, StatePrecision, forecast_query, predict_curve,
+    forecast_query, predict_curve, ReviewInput, RwkvInference, RwkvModel, RwkvStats, StatePrecision,
 };
 
 /// C ABI 版本。Dart 侧加载时比对，不一致视为库不可用（不崩）。
@@ -62,7 +62,6 @@ pub use rwkv::{
 /// 5：快照直接走文件的流式接口（`frwkv_runtime_snapshot_to_file` /
 /// `frwkv_runtime_restore_from_file`），文件格式与 `frwkv_runtime_snapshot` 的字节逐位相同。
 pub const ABI_VERSION: i32 = 5;
-
 
 /// 撤销日志最多留多少字节（小模型一条约 54 KB：卡 / 笔记两份紧凑状态 + 牌组 / 预设 / 全局三份
 /// f32 状态，32 MB 约 600 条）。超出时丢最早的条目；退得比这更深的（[RwkvRuntime::rewind_from]

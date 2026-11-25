@@ -26,7 +26,7 @@ use half::f16;
 use rayon::prelude::*;
 
 use super::super::slots::SlotStore;
-use super::super::{CARD_FEATURES, StatePrecision, add_scaled_in_place, dot_product, sigmoid};
+use super::super::{add_scaled_in_place, dot_product, sigmoid, StatePrecision, CARD_FEATURES};
 use super::weights::Weights;
 
 pub(super) const D: usize = 64;

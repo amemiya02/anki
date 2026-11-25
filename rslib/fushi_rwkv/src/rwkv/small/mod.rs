@@ -20,11 +20,11 @@ use std::sync::Arc;
 
 use super::slots::SlotStore;
 use super::{
-    CARD_FEATURES, FeatureState, ID_PLACEHOLDER, ReviewInput, RwkvStats, SnapshotReader,
-    StatePrecision, read_runtime_feature_state,
+    read_runtime_feature_state, FeatureState, ReviewInput, RwkvStats, SnapshotReader,
+    StatePrecision, CARD_FEATURES, ID_PLACEHOLDER,
 };
 pub use model::SmallHeads;
-use model::{COMPACT_STREAMS, Layout, Rows, STREAMS, SmallNet};
+use model::{Layout, Rows, SmallNet, COMPACT_STREAMS, STREAMS};
 use weights::Weights;
 
 /// Answered reviews per engine call. A call holds about 2.2 KB of scratch

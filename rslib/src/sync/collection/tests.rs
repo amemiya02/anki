@@ -649,7 +649,10 @@ async fn hayaki_rwkv_switch_follows_the_collection() -> Result<()> {
         ctx.normal_sync(&mut col1).await;
         assert!(col1.rwkv_enabled());
         assert_eq!(
-            col1.get_deck_config(DeckConfigId(1), false)?.unwrap().inner.new_per_day,
+            col1.get_deck_config(DeckConfigId(1), false)?
+                .unwrap()
+                .inner
+                .new_per_day,
             33
         );
         Ok(())
