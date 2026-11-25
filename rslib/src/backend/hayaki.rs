@@ -8,21 +8,48 @@ use std::time::Duration;
 
 use anki_proto::zz_hayaki::rwkv_status_response::State;
 use anki_proto::zz_hayaki::PrepareRwkvRequest;
+use anki_proto::zz_hayaki::RwkvModel;
 use anki_proto::zz_hayaki::RwkvStatusResponse;
-use fushi_rwkv::Model;
-use sha2::Digest;
+use anki_proto::zz_hayaki::RwkvWeights;
+use anki_proto::zz_hayaki::SetRwkvModelRequest;
 
 use super::Backend;
 use crate::prelude::*;
-use crate::scheduler::rwkv;
+use crate::scheduler::rwkv::set_loaded_model;
+use crate::scheduler::rwkv::LoadedModel;
+use crate::scheduler::rwkv::ModelSize;
 use crate::scheduler::rwkv::Status;
 use crate::services::BackendHayakiService;
 
-fn status_response(enabled: bool, status: Status) -> RwkvStatusResponse {
+fn proto_model(size: ModelSize) -> RwkvModel {
+    match size {
+        ModelSize::Big => RwkvModel::Big,
+        ModelSize::Small => RwkvModel::Small,
+        ModelSize::Tiny => RwkvModel::Tiny,
+    }
+}
+
+fn model_size(model: RwkvModel) -> ModelSize {
+    match model {
+        RwkvModel::Big => ModelSize::Big,
+        RwkvModel::Small => ModelSize::Small,
+        RwkvModel::Tiny => ModelSize::Tiny,
+    }
+}
+
+fn status_response((enabled, size, status): (bool, ModelSize, Status)) -> RwkvStatusResponse {
+    let weights = size.weights();
     let mut out = RwkvStatusResponse {
         enabled,
+        weights: Some(RwkvWeights {
+            file_name: weights.file_name.into(),
+            url: weights.url.into(),
+            sha256: weights.sha256.into(),
+            size: weights.len as u64,
+        }),
         ..Default::default()
     };
+    out.set_model(proto_model(size));
     match status {
         Status::NotPrepared => out.set_state(State::NotPrepared),
         Status::Preparing { done, total } => {
@@ -39,33 +66,29 @@ fn status_response(enabled: bool, status: Status) -> RwkvStatusResponse {
     out
 }
 
-fn weights_are_valid(bytes: &[u8]) -> bool {
-    bytes.len() == rwkv::WEIGHTS_LEN
-        && hex::encode(sha2::Sha256::digest(bytes)) == rwkv::WEIGHTS_SHA256
-}
-
 impl Backend {
-    /// The weights from `dir`, downloading them first if they are missing or
-    /// damaged.
-    fn rwkv_weights(&self, dir: &Path) -> Result<Vec<u8>> {
-        let path = dir.join(rwkv::WEIGHTS_FILE_NAME);
+    /// `size`'s weights from `dir`, downloading them first if they are
+    /// missing or damaged.
+    fn rwkv_weights(&self, dir: &Path, size: ModelSize) -> Result<Vec<u8>> {
+        let weights = size.weights();
+        let path = dir.join(weights.file_name);
         if let Ok(bytes) = std::fs::read(&path) {
-            if weights_are_valid(&bytes) {
+            if weights.is_valid(&bytes) {
                 return Ok(bytes);
             }
         }
         let bytes = self.runtime_handle().block_on(async {
             let response = self
                 .web_client()
-                .get(rwkv::WEIGHTS_URL)
-                .timeout(Duration::from_secs(120))
+                .get(weights.url)
+                .timeout(Duration::from_secs(600))
                 .send()
                 .await?
                 .error_for_status()?;
             response.bytes().await
         });
         let bytes = bytes.or_invalid("RWKV weights download")?;
-        if !weights_are_valid(&bytes) {
+        if !weights.is_valid(&bytes) {
             invalid_input!("RWKV weights download: size or SHA-256 does not match");
         }
         std::fs::create_dir_all(dir)?;
@@ -78,32 +101,49 @@ impl Backend {
 
 impl BackendHayakiService for Backend {
     fn rwkv_status(&self) -> Result<RwkvStatusResponse> {
-        self.with_col(|col| {
-            let (enabled, status) = col.rwkv_status();
-            Ok(status_response(enabled, status))
-        })
+        self.with_col(|col| Ok(status_response(col.rwkv_status())))
     }
 
     fn prepare_rwkv(&self, input: PrepareRwkvRequest) -> Result<RwkvStatusResponse> {
-        let bytes = self.rwkv_weights(Path::new(&input.weights_dir))?;
-        let model = Model::from_bytes(&bytes).or_invalid("RWKV weights")?;
-        rwkv::set_loaded_model(model.clone());
+        // The download runs without holding the collection.
+        let size = self.with_col(|col| Ok(col.rwkv_size()))?;
+        let bytes = self.rwkv_weights(Path::new(&input.weights_dir), size)?;
+        let model = LoadedModel::from_bytes(size, &bytes).or_invalid("RWKV weights")?;
         self.with_col(|col| {
+            // The choice may have changed during the download.
+            if col.rwkv_size() == size {
+                set_loaded_model(model.clone());
+            }
             col.rwkv_prepare(model)?;
-            let (enabled, status) = col.rwkv_status();
-            Ok(status_response(enabled, status))
+            Ok(status_response(col.rwkv_status()))
+        })
+    }
+
+    fn set_rwkv_model(&self, input: SetRwkvModelRequest) -> Result<RwkvStatusResponse> {
+        // An unknown value from a newer app must not sync as small.
+        let Ok(model) = RwkvModel::try_from(input.model) else {
+            invalid_input!("unknown RWKV model {}", input.model);
+        };
+        self.with_col(|col| {
+            col.rwkv_set_size(model_size(model))?;
+            Ok(status_response(col.rwkv_status()))
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use fushi_rwkv::ModelKind;
+    use fushi_rwkv::RwkvRuntime;
+
     use super::*;
 
     #[test]
-    fn rejects_weights_of_the_wrong_size_or_hash() {
-        assert!(!weights_are_valid(b"not weights"));
-        assert!(!weights_are_valid(&vec![0u8; rwkv::WEIGHTS_LEN]));
+    fn every_size_maps_to_its_own_proto_model() {
+        for size in ModelSize::ALL {
+            assert_eq!(model_size(proto_model(size)), size);
+        }
+        assert_eq!(model_size(RwkvModel::default()), ModelSize::default());
     }
 
     #[test]
@@ -114,11 +154,20 @@ mod tests {
         }
         let dir = tempfile::tempdir()?;
         let backend = Backend::new(I18n::template_only(), false);
-        let bytes = backend.rwkv_weights(dir.path())?;
-        assert!(weights_are_valid(&bytes));
-        assert!(Model::from_bytes(&bytes).is_ok());
-        // The second call reads the file instead of downloading.
-        assert_eq!(backend.rwkv_weights(dir.path())?, bytes);
+        for size in ModelSize::ALL {
+            let bytes = backend.rwkv_weights(dir.path(), size)?;
+            assert!(size.weights().is_valid(&bytes));
+            let loaded = LoadedModel::from_bytes(size, &bytes)?;
+            let kind = if size == ModelSize::Big {
+                ModelKind::Large
+            } else {
+                ModelKind::Small
+            };
+            assert_eq!(loaded.model.kind(), kind);
+            assert!(RwkvRuntime::new(&loaded.model, size.precision(), 0).is_ok());
+            // The second call reads the file instead of downloading.
+            assert_eq!(backend.rwkv_weights(dir.path(), size)?, bytes);
+        }
         Ok(())
     }
 }

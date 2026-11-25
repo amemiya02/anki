@@ -1,9 +1,9 @@
 // Copyright: Ankitects Pty Ltd and contributors
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
-//! Tests that need the model read its weights from the file named by
-//! HAYAKI_RWKV_WEIGHTS and are skipped when it is unset, so the suite runs
-//! without network access.
+//! Tests that need a model read its weights from the folder named by
+//! HAYAKI_RWKV_WEIGHTS_DIR, under the file names of [ModelSize::weights], and
+//! are skipped when it is unset, so the suite runs without network access.
 
 use std::time::Duration;
 use std::time::Instant;
@@ -12,9 +12,15 @@ use super::*;
 use crate::card::CardType;
 use crate::scheduler::queue::QueueEntryKind;
 
-fn weights() -> Option<Model> {
-    let path = std::env::var("HAYAKI_RWKV_WEIGHTS").ok()?;
-    Some(Model::from_bytes(&std::fs::read(path).unwrap()).unwrap())
+fn weights_of(size: ModelSize) -> Option<LoadedModel> {
+    let dir = std::env::var("HAYAKI_RWKV_WEIGHTS_DIR").ok()?;
+    let bytes = std::fs::read(Path::new(&dir).join(size.weights().file_name)).unwrap();
+    assert!(size.weights().is_valid(&bytes));
+    Some(LoadedModel::from_bytes(size, &bytes).unwrap())
+}
+
+fn weights() -> Option<LoadedModel> {
+    weights_of(ModelSize::Small)
 }
 
 const CARDS: i64 = 40;
@@ -81,7 +87,7 @@ fn set_switch(col: &mut Collection, on: bool) {
 fn wait_ready(col: &Collection) {
     let started = Instant::now();
     loop {
-        match col.rwkv_status().1 {
+        match col.rwkv_status().2 {
             Status::Ready => return,
             Status::Failed(err) => panic!("RWKV failed: {err}"),
             _ if started.elapsed() > Duration::from_secs(60) => panic!("RWKV not ready"),
@@ -92,7 +98,7 @@ fn wait_ready(col: &Collection) {
 
 fn prepared(col: &mut Collection) -> bool {
     let Some(model) = weights() else {
-        println!("HAYAKI_RWKV_WEIGHTS not set; skipping");
+        println!("HAYAKI_RWKV_WEIGHTS_DIR not set; skipping");
         return false;
     };
     set_switch(col, true);
@@ -116,7 +122,7 @@ fn switch_on_without_a_ready_model_keeps_the_upstream_queue() {
     let upstream = review_queue(&mut col);
     assert!(!upstream.is_empty());
     set_switch(&mut col, true);
-    assert_eq!(col.rwkv_status().1, Status::NotPrepared);
+    assert_eq!(col.rwkv_status().2, Status::NotPrepared);
     assert_eq!(review_queue(&mut col), upstream);
     set_switch(&mut col, false);
     assert_eq!(review_queue(&mut col), upstream);
@@ -197,7 +203,7 @@ fn history_changes_force_a_full_replay() {
 #[test]
 fn a_reopened_collection_restores_the_snapshot() {
     let Some(model) = weights() else {
-        println!("HAYAKI_RWKV_WEIGHTS not set; skipping");
+        println!("HAYAKI_RWKV_WEIGHTS_DIR not set; skipping");
         return;
     };
     let dir = tempfile::tempdir().unwrap();
@@ -225,13 +231,13 @@ fn a_reopened_collection_restores_the_snapshot() {
         .unwrap();
     col.rwkv_prepare(model).unwrap();
     // Restoring a snapshot reports no replay progress.
-    assert_eq!(col.rwkv_status().1, Status::Preparing { done: 0, total: 0 });
+    assert_eq!(col.rwkv_status().2, Status::Preparing { done: 0, total: 0 });
     wait_ready(&col);
     assert_eq!(scores(&mut col), expected);
 }
 
 fn is_replaying(col: &Collection) -> bool {
-    matches!(col.rwkv_status().1, Status::Preparing { total, .. } if total > 0)
+    matches!(col.rwkv_status().2, Status::Preparing { total, .. } if total > 0)
 }
 
 /// A sync can bring a card moved on another device with a modification time
@@ -314,7 +320,7 @@ fn undoing_a_set_due_date_needs_no_replay() {
 #[test]
 fn answering_writes_the_same_rows_with_the_switch_on() {
     let Some(_) = weights() else {
-        println!("HAYAKI_RWKV_WEIGHTS not set; skipping");
+        println!("HAYAKI_RWKV_WEIGHTS_DIR not set; skipping");
         return;
     };
     let answer_first_card = |col: &mut Collection| {
@@ -456,4 +462,172 @@ fn undoing_a_deck_move_is_noticed() {
     wait_ready(&col);
     let home = col.state.rwkv.lock().unwrap().replayed.cards[&card.id.0].home_deck_id;
     assert_eq!(home, card.deck_id.0);
+}
+
+fn set_size(col: &mut Collection, size: ModelSize) {
+    col.rwkv_set_size(size).unwrap();
+}
+
+#[test]
+fn the_model_choice_defaults_to_small() {
+    let mut col = collection_with_history();
+    assert_eq!(col.rwkv_size(), ModelSize::Small);
+    set_size(&mut col, ModelSize::Tiny);
+    assert_eq!(col.rwkv_size(), ModelSize::Tiny);
+    // An unknown value, say from a newer app, falls back to small.
+    col.set_config_json(SIZE_CONFIG_KEY, &"huge", false)
+        .unwrap();
+    assert_eq!(col.rwkv_size(), ModelSize::Small);
+}
+
+#[test]
+fn every_size_prepares_and_queues() {
+    for size in ModelSize::ALL {
+        let mut col = collection_with_history();
+        let Some(model) = weights_of(size) else {
+            println!("HAYAKI_RWKV_WEIGHTS_DIR not set; skipping");
+            return;
+        };
+        set_switch(&mut col, true);
+        set_size(&mut col, size);
+        col.rwkv_prepare(model).unwrap();
+        wait_ready(&col);
+        let due = col.rwkv_due_review_cards(false).unwrap().unwrap();
+        assert!(due.iter().all(|c| c.retrievability <= 0.9), "{size:?}");
+        assert_eq!(
+            review_queue(&mut col),
+            due.iter().map(|c| c.card.id).collect::<Vec<_>>(),
+            "{size:?}"
+        );
+    }
+}
+
+#[test]
+fn choosing_another_model_drops_the_old_one_until_the_new_one_is_prepared() {
+    let mut col = collection_with_history();
+    let upstream = review_queue(&mut col);
+    if !prepared(&mut col) {
+        return;
+    }
+    let small = scores(&mut col);
+    set_size(&mut col, ModelSize::Tiny);
+    assert_eq!(col.rwkv_status().2, Status::NotPrepared);
+    // No tiny model is loaded, so study falls back.
+    assert!(col.rwkv_due_review_cards(false).unwrap().is_none());
+    assert_eq!(review_queue(&mut col), upstream);
+
+    // The small model no longer prepares the collection.
+    col.rwkv_prepare(weights().unwrap()).unwrap();
+    assert_eq!(col.rwkv_status().2, Status::NotPrepared);
+
+    let Some(tiny) = weights_of(ModelSize::Tiny) else {
+        return;
+    };
+    col.rwkv_prepare(tiny).unwrap();
+    wait_ready(&col);
+    assert_ne!(scores(&mut col), small);
+
+    // Back to small: a full replay gives the same predictions as before.
+    set_size(&mut col, ModelSize::Small);
+    col.rwkv_prepare(weights().unwrap()).unwrap();
+    wait_ready(&col);
+    assert_eq!(scores(&mut col), small);
+}
+
+#[test]
+fn a_synced_choice_is_followed_at_the_next_study() {
+    let mut col = collection_with_history();
+    let upstream = review_queue(&mut col);
+    if !prepared(&mut col) {
+        return;
+    }
+    // A sync writes the key without going through rwkv_set_size.
+    col.set_config_json(SIZE_CONFIG_KEY, &ModelSize::Big, false)
+        .unwrap();
+    assert_eq!(col.rwkv_status().2, Status::NotPrepared);
+    assert_eq!(review_queue(&mut col), upstream);
+}
+
+/// The process keeps the model the app last loaded, so a collection prepares
+/// itself at study time, but only from a model of the size it chose.
+#[test]
+fn study_prepares_from_the_loaded_model_of_the_chosen_size() {
+    let (Some(small), Some(tiny)) = (weights(), weights_of(ModelSize::Tiny)) else {
+        println!("HAYAKI_RWKV_WEIGHTS_DIR not set; skipping");
+        return;
+    };
+    // The slot is process-wide; other tests never set it.
+    let previous = LOADED_MODEL.lock().unwrap().take();
+    let mut col = collection_with_history();
+    set_switch(&mut col, true);
+    set_size(&mut col, ModelSize::Tiny);
+    set_loaded_model(small);
+    assert!(col.rwkv_due_review_cards(false).unwrap().is_none());
+    assert_eq!(col.rwkv_status().2, Status::NotPrepared);
+
+    set_loaded_model(tiny);
+    assert!(col.rwkv_due_review_cards(false).unwrap().is_none());
+    wait_ready(&col);
+    assert!(col.rwkv_due_review_cards(false).unwrap().is_some());
+    *LOADED_MODEL.lock().unwrap() = previous;
+}
+
+#[test]
+fn choosing_a_model_during_a_replay_drops_that_replay() {
+    let mut col = collection_with_history();
+    let (Some(small), Some(tiny)) = (weights(), weights_of(ModelSize::Tiny)) else {
+        println!("HAYAKI_RWKV_WEIGHTS_DIR not set; skipping");
+        return;
+    };
+    set_switch(&mut col, true);
+    col.rwkv_prepare(small).unwrap();
+    set_size(&mut col, ModelSize::Tiny);
+    assert_eq!(col.rwkv_status().2, Status::NotPrepared);
+    col.rwkv_prepare(tiny).unwrap();
+    wait_ready(&col);
+    // The superseded small replay never installs its runtime.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(col.rwkv_status().2, Status::Ready);
+    assert_eq!(
+        col.state.rwkv.lock().unwrap().size(),
+        Some(ModelSize::Tiny)
+    );
+}
+
+#[test]
+fn a_snapshot_of_another_model_is_not_restored() {
+    let (Some(small), Some(tiny)) = (weights(), weights_of(ModelSize::Tiny)) else {
+        println!("HAYAKI_RWKV_WEIGHTS_DIR not set; skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("collection.anki2");
+    collection_with_history()
+        .storage
+        .db
+        .execute(&format!("vacuum into '{}'", path.display()), [])
+        .unwrap();
+    {
+        let mut col = crate::collection::CollectionBuilder::new(&path)
+            .build()
+            .unwrap();
+        set_switch(&mut col, true);
+        col.rwkv_prepare(small).unwrap();
+        wait_ready(&col);
+        set_size(&mut col, ModelSize::Tiny);
+        col.close(None).unwrap();
+    }
+    let mut col = crate::collection::CollectionBuilder::new(&path)
+        .build()
+        .unwrap();
+    col.rwkv_prepare(tiny).unwrap();
+    wait_ready(&col);
+    assert!(col.rwkv_due_review_cards(false).unwrap().is_some());
+    // The tiny model's state replaced the small model's snapshot on disk.
+    let bytes = std::fs::read(path.with_extension("rwkv")).unwrap();
+    let sha = ModelSize::Tiny.weights().sha256.as_bytes();
+    assert_eq!(
+        &bytes[SNAPSHOT_MAGIC.len()..SNAPSHOT_MAGIC.len() + sha.len()],
+        sha
+    );
 }

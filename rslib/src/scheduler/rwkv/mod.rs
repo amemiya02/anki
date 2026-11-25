@@ -14,6 +14,7 @@
 //! follows new answers, undos and syncs through [Engine::catch_up].
 
 pub(crate) mod history;
+mod size;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -24,16 +25,18 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use fushi_rwkv::Model;
 use fushi_rwkv::ReviewInput;
 use fushi_rwkv::RwkvRuntime;
-use fushi_rwkv::StatePrecision;
 use history::CardHistory;
 use history::KeptRow;
 use history::Mappings;
 use history::RevlogRow;
 use serde::Deserialize;
 use serde::Serialize;
+pub use size::LoadedModel;
+pub use size::ModelSize;
+pub use size::WeightsFile;
+pub use size::SIZE_CONFIG_KEY;
 
 use super::queue::DueCard;
 use super::queue::DueCardKind;
@@ -43,13 +46,6 @@ use crate::prelude::*;
 
 /// The collection config key that turns RWKV scheduling on. Absent means off.
 pub const CONFIG_KEY: &str = "hayakiRwkvScheduling";
-
-/// The small model `sm56` (JSchoreels/anki-rwkv), int8 weights. The weights are
-/// for personal and research use; see WEIGHTS-NOTICE.md in that repository.
-pub const WEIGHTS_FILE_NAME: &str = "rwkv-sm56-weights.int8.bin";
-pub const WEIGHTS_URL: &str = "https://raw.githubusercontent.com/JSchoreels/anki/001440b03395f24ffc1714b18ad3d9d4d89d2067/qt/aqt/rwkv_inference/sm56/weights.int8.bin";
-pub const WEIGHTS_SHA256: &str = "479b3e2bc6a1c900ba8a4a45d629965c6df2a20cc8ff294583f5aeaeea3b4fdd";
-pub const WEIGHTS_LEN: usize = 436_391;
 
 /// A card answered today comes back only after this long...
 const MIN_ELAPSED_SECS: i64 = 30;
@@ -122,7 +118,7 @@ struct Score {
 pub struct Engine {
     status: Status,
     failed_at: Option<Instant>,
-    model: Option<Model>,
+    model: Option<LoadedModel>,
     runtime: Option<RwkvRuntime>,
     replayed: Replayed,
     scores: HashMap<i64, Score>,
@@ -149,16 +145,20 @@ impl fmt::Debug for Engine {
 pub type SharedEngine = Arc<Mutex<Engine>>;
 
 /// The model the app loaded with PrepareRwkv in this process. A collection
-/// opened later (another profile, or after a full sync) prepares itself from
-/// it without another call.
-static LOADED_MODEL: Mutex<Option<Model>> = Mutex::new(None);
+/// opened later (another profile, or after a full sync) that chose the same
+/// size prepares itself from it without another call.
+static LOADED_MODEL: Mutex<Option<LoadedModel>> = Mutex::new(None);
 
-pub fn set_loaded_model(model: Model) {
+pub fn set_loaded_model(model: LoadedModel) {
     *LOADED_MODEL.lock().unwrap() = Some(model);
 }
 
-fn loaded_model() -> Option<Model> {
-    LOADED_MODEL.lock().unwrap().clone()
+fn loaded_model(size: ModelSize) -> Option<LoadedModel> {
+    LOADED_MODEL
+        .lock()
+        .unwrap()
+        .clone()
+        .filter(|loaded| loaded.size == size)
 }
 
 /// What a caller needs to know about one review card the RWKV rule queues.
@@ -221,6 +221,25 @@ impl Engine {
 
     fn is_ready(&self) -> bool {
         self.status == Status::Ready && self.runtime.is_some()
+    }
+
+    fn size(&self) -> Option<ModelSize> {
+        self.model.as_ref().map(|loaded| loaded.size)
+    }
+
+    /// Drops a model of another size than the collection chose, so study
+    /// uses upstream's rule until the chosen one is prepared.
+    fn forget_other_size(&mut self, chosen: ModelSize) {
+        if self.size().is_some_and(|size| size != chosen) {
+            self.replay_generation += 1;
+            self.model = None;
+            self.runtime = None;
+            self.replayed = Replayed::default();
+            self.scores.clear();
+            self.status = Status::NotPrepared;
+            self.failed_at = None;
+            self.epoch += 1;
+        }
     }
 
     fn fail(&mut self, message: String) {
@@ -306,30 +325,33 @@ impl Engine {
     /// outside it.
     fn snapshot_bytes(&self) -> Option<(PathBuf, Vec<u8>)> {
         let path = self.snapshot_path.clone()?;
+        let sha256 = self.size()?.weights().sha256;
         let state = self.runtime.as_ref()?.snapshot().ok()?;
         let replayed = serde_json::to_vec(&self.replayed).ok()?;
         let mut bytes = Vec::with_capacity(80 + replayed.len() + state.len());
         bytes.extend_from_slice(SNAPSHOT_MAGIC);
-        bytes.extend_from_slice(WEIGHTS_SHA256.as_bytes());
+        bytes.extend_from_slice(sha256.as_bytes());
         bytes.extend_from_slice(&(replayed.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&replayed);
         bytes.extend_from_slice(&state);
         Some((path, bytes))
     }
 
-    fn read_snapshot(path: &Path, model: &Model) -> Option<(Replayed, RwkvRuntime)> {
+    /// A snapshot is refused unless it was taken with the same weights.
+    fn read_snapshot(path: &Path, loaded: &LoadedModel) -> Option<(Replayed, RwkvRuntime)> {
         let bytes = std::fs::read(path).ok()?;
-        let header = SNAPSHOT_MAGIC.len() + WEIGHTS_SHA256.len();
+        let sha256 = loaded.size.weights().sha256;
+        let header = SNAPSHOT_MAGIC.len() + sha256.len();
         if bytes.len() < header + 8
             || &bytes[..SNAPSHOT_MAGIC.len()] != SNAPSHOT_MAGIC
-            || &bytes[SNAPSHOT_MAGIC.len()..header] != WEIGHTS_SHA256.as_bytes()
+            || &bytes[SNAPSHOT_MAGIC.len()..header] != sha256.as_bytes()
         {
             return None;
         }
         let len = u64::from_le_bytes(bytes[header..header + 8].try_into().ok()?) as usize;
         let body = header + 8;
         let replayed: Replayed = serde_json::from_slice(bytes.get(body..body + len)?).ok()?;
-        let mut runtime = RwkvRuntime::new(model, StatePrecision::Int4, 0).ok()?;
+        let mut runtime = RwkvRuntime::new(&loaded.model, loaded.size.precision(), 0).ok()?;
         runtime.restore(bytes.get(body + len..)?).ok()?;
         Some((replayed, runtime))
     }
@@ -346,6 +368,20 @@ impl Engine {
     }
 }
 
+/// Whether `path` holds a snapshot taken with the weights `sha256`, read
+/// from its header only. A snapshot of another model is replaced by the next
+/// full replay.
+fn snapshot_is_for(path: &Path, sha256: &str) -> bool {
+    use std::io::Read;
+    let mut header = vec![0; SNAPSHOT_MAGIC.len() + sha256.len()];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .is_ok_and(|_| {
+            &header[..SNAPSHOT_MAGIC.len()] == SNAPSHOT_MAGIC
+                && &header[SNAPSHOT_MAGIC.len()..] == sha256.as_bytes()
+        })
+}
+
 fn write_snapshot_file(path: &Path, bytes: &[u8]) {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -359,7 +395,12 @@ fn write_snapshot_file(path: &Path, bytes: &[u8]) {
 
 /// Replays `input` into a fresh runtime off the collection thread, then
 /// installs it if no newer replay has started and the collection is open.
-fn spawn_full_replay(shared: SharedEngine, model: Model, input: ReplayInput, generation: u64) {
+fn spawn_full_replay(
+    shared: SharedEngine,
+    model: LoadedModel,
+    input: ReplayInput,
+    generation: u64,
+) {
     std::thread::spawn(move || {
         let result = full_replay(&shared, &model, &input, generation);
         let snapshot = {
@@ -393,7 +434,7 @@ fn spawn_full_replay(shared: SharedEngine, model: Model, input: ReplayInput, gen
 /// Restores the snapshot off the collection thread. If it cannot be read, it
 /// is removed and the engine goes back to not prepared, so the next
 /// preparation replays in full.
-fn spawn_restore(shared: SharedEngine, model: Model, path: PathBuf, generation: u64) {
+fn spawn_restore(shared: SharedEngine, model: LoadedModel, path: PathBuf, generation: u64) {
     std::thread::spawn(move || {
         let restored = Engine::read_snapshot(&path, &model);
         let mut engine = shared.lock().unwrap();
@@ -419,14 +460,14 @@ fn spawn_restore(shared: SharedEngine, model: Model, path: PathBuf, generation: 
 
 fn full_replay(
     shared: &SharedEngine,
-    model: &Model,
+    loaded: &LoadedModel,
     input: &ReplayInput,
     generation: u64,
 ) -> std::result::Result<(RwkvRuntime, Replayed), String> {
     let rows = history::select_rows(&input.revlog, &input.mappings);
     let total = rows.len() as u64;
     let mut runtime =
-        RwkvRuntime::new(model, StatePrecision::Int4, 0).map_err(|e| e.to_string())?;
+        RwkvRuntime::new(&loaded.model, loaded.size.precision(), 0).map_err(|e| e.to_string())?;
     let mut replayed = Replayed {
         mappings: input.mappings.clone(),
         rollover_secs: input.timing.next_day_at.0.rem_euclid(86_400),
@@ -477,20 +518,48 @@ impl Collection {
         self.col_path.with_extension("rwkv")
     }
 
-    pub fn rwkv_status(&self) -> (bool, Status) {
-        let status = self.state.rwkv.lock().unwrap().status.clone();
-        (self.rwkv_enabled(), status)
+    /// The model the collection chose; a sync can change it.
+    pub fn rwkv_size(&self) -> ModelSize {
+        self.get_config_optional(SIZE_CONFIG_KEY)
+            .unwrap_or_default()
+    }
+
+    /// Chooses the model. The engine drops a model of another size at once,
+    /// so study uses upstream's rule until the app prepares the new one.
+    pub fn rwkv_set_size(&mut self, size: ModelSize) -> Result<()> {
+        self.set_config_json(SIZE_CONFIG_KEY, &size, false)?;
+        self.state.rwkv.lock().unwrap().forget_other_size(size);
+        Ok(())
+    }
+
+    /// Whether the switch is on, the chosen size, and the status of that
+    /// size's model. An engine still holding another size is not prepared.
+    pub fn rwkv_status(&self) -> (bool, ModelSize, Status) {
+        let size = self.rwkv_size();
+        let engine = self.state.rwkv.lock().unwrap();
+        let status = if engine.size().is_some_and(|loaded| loaded != size) {
+            Status::NotPrepared
+        } else {
+            engine.status.clone()
+        };
+        (self.rwkv_enabled(), size, status)
     }
 
     /// Installs the model, then restores the snapshot or starts a full
     /// replay, both in the background. Safe to call again; a ready or
-    /// preparing engine is kept.
-    pub fn rwkv_prepare(&mut self, model: Model) -> Result<()> {
+    /// preparing engine of the same size is kept. A model of a size the
+    /// collection no longer chose is ignored.
+    pub fn rwkv_prepare(&mut self, model: LoadedModel) -> Result<()> {
+        let chosen = self.rwkv_size();
+        if model.size != chosen {
+            return Ok(());
+        }
         let shared = self.state.rwkv.clone();
         // An in-memory collection (tests) has no file to keep a snapshot beside.
         let snapshot_path = self.col_path.is_file().then(|| self.rwkv_snapshot_path());
         let mut engine = shared.lock().unwrap();
         engine.snapshot_path = snapshot_path.clone();
+        engine.forget_other_size(chosen);
         if engine.is_ready()
             || (matches!(engine.status, Status::Preparing { .. }) && engine.model.is_some())
         {
@@ -498,7 +567,8 @@ impl Collection {
         }
         engine.model = Some(model.clone());
         engine.failed_at = None;
-        if let Some(path) = snapshot_path.filter(|path| path.exists()) {
+        let sha256 = model.size.weights().sha256;
+        if let Some(path) = snapshot_path.filter(|path| snapshot_is_for(path, sha256)) {
             engine.replay_generation += 1;
             engine.runtime = None;
             engine.status = Status::Preparing { done: 0, total: 0 };
@@ -723,15 +793,20 @@ impl Collection {
             return Ok(None);
         }
         let shared = self.state.rwkv.clone();
-        let needs_preparing = shared.try_lock().is_ok_and(|engine| match engine.status {
-            Status::NotPrepared => true,
-            Status::Failed(_) => engine
-                .failed_at
-                .is_none_or(|at| at.elapsed() >= RETRY_FAILED_AFTER),
-            _ => false,
+        let chosen = self.rwkv_size();
+        let needs_preparing = shared.try_lock().is_ok_and(|mut engine| {
+            // A sync can bring another device's choice.
+            engine.forget_other_size(chosen);
+            match engine.status {
+                Status::NotPrepared => true,
+                Status::Failed(_) => engine
+                    .failed_at
+                    .is_none_or(|at| at.elapsed() >= RETRY_FAILED_AFTER),
+                _ => false,
+            }
         });
         if needs_preparing {
-            if let Some(model) = loaded_model() {
+            if let Some(model) = loaded_model(chosen) {
                 self.rwkv_prepare(model)?;
             }
         }
@@ -740,6 +815,9 @@ impl Collection {
         let Ok(mut engine) = shared.try_lock() else {
             return Ok(None);
         };
+        // The first try_lock may have failed while a thread of the old size
+        // held the engine.
+        engine.forget_other_size(chosen);
         let timing = self.timing_today()?;
         match self.rwkv_catch_up(&shared, &mut engine, &timing) {
             Ok(CatchUp::Ready) => {}

@@ -24,10 +24,31 @@ service BackendHayakiService {
   // them, and starts preparing the open collection in the background.
   // Returns once preparation has started; poll RwkvStatus for progress.
   rpc PrepareRwkv(PrepareRwkvRequest) returns (RwkvStatusResponse);
+  // Chooses the model. The choice syncs with the collection. With the switch
+  // on, call PrepareRwkv next.
+  rpc SetRwkvModel(SetRwkvModelRequest) returns (RwkvStatusResponse);
 }
 
 message PrepareRwkvRequest {
   string weights_dir = 1;
+}
+
+enum RwkvModel {
+  RWKV_MODEL_SMALL = 0;
+  RWKV_MODEL_BIG = 1;
+  RWKV_MODEL_TINY = 2;
+}
+
+message SetRwkvModelRequest {
+  RwkvModel model = 1;
+}
+
+// The weights file of a model, for apps that download it themselves.
+message RwkvWeights {
+  string file_name = 1;
+  string url = 2;
+  string sha256 = 3;
+  uint64 size = 4;
 }
 
 message RwkvStatusResponse {
@@ -42,4 +63,7 @@ message RwkvStatusResponse {
   uint64 done = 3;
   uint64 total = 4;
   string error = 5;
+  // The chosen model; state and progress are that model's.
+  RwkvModel model = 6;
+  RwkvWeights weights = 7;
 }

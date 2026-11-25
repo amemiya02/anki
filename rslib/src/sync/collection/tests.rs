@@ -659,7 +659,7 @@ async fn hayaki_rwkv_switch_follows_the_collection() -> Result<()> {
 
 /// Config syncs as a whole map from the newer collection. A device that
 /// changed any config after the switch was turned on elsewhere, and syncs
-/// last, turns the switch back. The help text beside the switch says so.
+/// last, turns the switch back.
 #[tokio::test]
 async fn hayaki_rwkv_switch_is_last_writer_wins() -> Result<()> {
     use crate::scheduler::rwkv::CONFIG_KEY;
@@ -678,6 +678,27 @@ async fn hayaki_rwkv_switch_is_last_writer_wins() -> Result<()> {
         ctx.normal_sync(&mut col1).await;
         assert!(!col1.rwkv_enabled());
         assert!(!col2.rwkv_enabled());
+        Ok(())
+    })
+    .await
+}
+
+/// The model choice is a collection config key too, so it follows the
+/// collection.
+#[tokio::test]
+async fn hayaki_rwkv_model_follows_the_collection() -> Result<()> {
+    use crate::scheduler::rwkv::ModelSize;
+    with_active_server(|client| async move {
+        let ctx = SyncTestContext::new(client);
+        upload_download(&ctx).await?;
+        let mut col1 = ctx.col1();
+        let mut col2 = ctx.col2();
+        assert_eq!(col2.rwkv_size(), ModelSize::Small);
+
+        col1.rwkv_set_size(ModelSize::Tiny)?;
+        ctx.normal_sync(&mut col1).await;
+        ctx.normal_sync(&mut col2).await;
+        assert_eq!(col2.rwkv_size(), ModelSize::Tiny);
         Ok(())
     })
     .await
