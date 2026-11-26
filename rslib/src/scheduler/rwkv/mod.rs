@@ -47,6 +47,10 @@ use crate::prelude::*;
 /// The collection config key that turns RWKV scheduling on. Absent means off.
 pub const CONFIG_KEY: &str = "hayakiRwkvScheduling";
 
+/// The collection config key that fixes each day's RWKV reviews at the first
+/// study of the day. Absent means off: the list follows every answer.
+pub const DAILY_LIST_CONFIG_KEY: &str = "hayakiRwkvDailyList";
+
 /// A card answered today comes back only after this long...
 const MIN_ELAPSED_SECS: i64 = 30;
 /// ...and after this many other answers (kuma3 defaults).
@@ -114,6 +118,39 @@ struct Score {
     r: f32,
 }
 
+/// The reviews the RWKV rule chose at the first study of a day, lowest
+/// predicted recall first. Kept beside the collection, so closing the app
+/// keeps them. A card leaves the day's queue once answered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct DailyList {
+    day: i64,
+    size: ModelSize,
+    cards: Vec<DailyCard>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct DailyCard {
+    id: i64,
+    /// None for a card the model could not score.
+    r: Option<f32>,
+}
+
+impl DailyList {
+    fn is_for(&self, day: i64, size: ModelSize) -> bool {
+        self.day == day && self.size == size
+    }
+
+    fn read(path: &Path) -> Option<Self> {
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    }
+
+    fn write(&self, path: &Path) {
+        if let Ok(bytes) = serde_json::to_vec(self) {
+            replace_file(path, &bytes);
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Engine {
     status: Status,
@@ -123,6 +160,9 @@ pub struct Engine {
     replayed: Replayed,
     scores: HashMap<i64, Score>,
     answers_since_requery: u32,
+    /// The day's reviews, fixed at the first study of the day while
+    /// [DAILY_LIST_CONFIG_KEY] is on.
+    daily: Option<DailyList>,
     /// Bumped whenever the engine becomes ready or replays in full, so cached
     /// study queues built under another state are rebuilt.
     pub(crate) epoch: u64,
@@ -362,7 +402,7 @@ impl Engine {
         self.replay_generation += 1;
         if self.is_ready() {
             if let Some((path, bytes)) = self.snapshot_bytes() {
-                write_snapshot_file(&path, &bytes);
+                replace_file(&path, &bytes);
             }
         }
     }
@@ -382,7 +422,9 @@ fn snapshot_is_for(path: &Path, sha256: &str) -> bool {
         })
 }
 
-fn write_snapshot_file(path: &Path, bytes: &[u8]) {
+/// Writes `bytes` to `path` through a temporary file, so a reader never sees
+/// half of it. Failures are ignored: the file only saves work.
+fn replace_file(path: &Path, bytes: &[u8]) {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -426,7 +468,7 @@ fn spawn_full_replay(
             }
         };
         if let Some((path, bytes)) = snapshot {
-            write_snapshot_file(&path, &bytes);
+            replace_file(&path, &bytes);
         }
     });
 }
@@ -496,6 +538,11 @@ fn full_replay(
     Ok((runtime, replayed))
 }
 
+/// When the scheduling day began, in milliseconds like revlog ids.
+fn day_start_ms(timing: &SchedTimingToday) -> i64 {
+    (timing.next_day_at.0 - 86_400) * 1000
+}
+
 /// A card answered today comes back only after [MIN_ELAPSED_SECS] and
 /// [MIN_INTERVENING_REVIEWS] other answers.
 fn same_day_guard_passes(intervening_reviews: u64, elapsed_secs: i64) -> bool {
@@ -516,6 +563,19 @@ impl Collection {
 
     fn rwkv_snapshot_path(&self) -> PathBuf {
         self.col_path.with_extension("rwkv")
+    }
+
+    /// Whether each day's reviews are fixed at the first study of the day.
+    pub fn rwkv_daily_list(&self) -> bool {
+        self.get_config_optional::<bool, _>(DAILY_LIST_CONFIG_KEY)
+            .unwrap_or(false)
+    }
+
+    /// Where the day's list is kept. None for an in-memory collection.
+    fn rwkv_daily_list_path(&self) -> Option<PathBuf> {
+        self.col_path
+            .is_file()
+            .then(|| self.col_path.with_extension("rwkv-daily"))
     }
 
     /// The model the collection chose; a sync can change it.
@@ -837,14 +897,19 @@ impl Collection {
     }
 
     /// The epoch the queues must be built under; differs from the one stored
-    /// with the queues after the engine became ready or replayed.
-    /// None while a replay thread holds the engine, so callers keep what
-    /// they have.
+    /// with the queues after the engine became ready or replayed, or the
+    /// daily list was switched. None while a replay thread holds the engine,
+    /// so callers keep what they have.
     pub(crate) fn rwkv_epoch(&self) -> Option<u64> {
         if !self.rwkv_enabled() {
             return Some(0);
         }
-        self.state.rwkv.try_lock().ok().map(|engine| engine.epoch)
+        let daily = u64::from(self.rwkv_daily_list());
+        self.state
+            .rwkv
+            .try_lock()
+            .ok()
+            .map(|engine| engine.epoch * 2 + daily)
     }
 
     /// The review cards in their home deck that the RWKV rule queues today,
@@ -864,6 +929,85 @@ impl Collection {
         timing: &SchedTimingToday,
         active_only: bool,
     ) -> Result<Vec<RwkvDueCard>> {
+        let candidates = self.rwkv_candidates(active_only)?;
+        let daily_path = self.rwkv_daily_list_path();
+        if !self.rwkv_daily_list() {
+            engine.daily = None;
+            if let Some(path) = daily_path.filter(|path| path.exists()) {
+                let _ = std::fs::remove_file(path);
+            }
+            return self.rwkv_score(engine, timing, candidates, true);
+        }
+
+        let today = timing.days_elapsed as i64;
+        let size = engine.size().or_invalid("RWKV model missing")?;
+        if !engine
+            .daily
+            .as_ref()
+            .is_some_and(|list| list.is_for(today, size))
+        {
+            let kept = daily_path
+                .as_deref()
+                .and_then(DailyList::read)
+                .filter(|list| list.is_for(today, size));
+            let list = match kept {
+                Some(list) => list,
+                None => {
+                    // The list covers every deck, so studying one deck first
+                    // fixes the other decks' reviews too.
+                    let every = if active_only {
+                        self.rwkv_candidates(false)?
+                    } else {
+                        candidates.clone()
+                    };
+                    let due = self.rwkv_score(engine, timing, every, false)?;
+                    let list = DailyList {
+                        day: today,
+                        size,
+                        cards: due
+                            .iter()
+                            .map(|c| DailyCard {
+                                id: c.card.id.0,
+                                r: c.retrievability.is_finite().then_some(c.retrievability),
+                            })
+                            .collect(),
+                    };
+                    if let Some(path) = &daily_path {
+                        list.write(path);
+                    }
+                    list
+                }
+            };
+            engine.daily = Some(list);
+        }
+
+        // Cards leave the list once answered, or once no longer review cards
+        // in their home deck (and the active decks, with `active_only`).
+        let day_start_ms = day_start_ms(timing);
+        let mut by_id: HashMap<i64, DueCard> =
+            candidates.into_iter().map(|c| (c.id.0, c)).collect();
+        let list = engine.daily.as_ref().or_invalid("RWKV daily list")?;
+        Ok(list
+            .cards
+            .iter()
+            .filter_map(|entry| {
+                let card = by_id.remove(&entry.id)?;
+                let answered_today = engine
+                    .replayed
+                    .cards
+                    .get(&entry.id)
+                    .is_some_and(|last| last.last_review_id >= day_start_ms);
+                (!answered_today).then_some(RwkvDueCard {
+                    card,
+                    retrievability: entry.r.unwrap_or(f32::NAN),
+                })
+            })
+            .collect())
+    }
+
+    /// The review cards in their home deck, limited to the active decks of
+    /// the current queue build with `active_only`.
+    fn rwkv_candidates(&self, active_only: bool) -> Result<Vec<DueCard>> {
         let sql = format!(
             "select id, nid, due, mod, did, odid, reps from cards where queue = {} and odid = 0 {}",
             CardQueue::Review as i8,
@@ -890,7 +1034,19 @@ impl Collection {
                 })
             })?
             .collect::<std::result::Result<_, _>>()?;
+        Ok(candidates)
+    }
 
+    /// The `candidates` the RWKV rule queues today, lowest predicted recall
+    /// first. A card answered today comes back through the same-day guard
+    /// with `same_day`, and not at all without it.
+    fn rwkv_score(
+        &mut self,
+        engine: &mut Engine,
+        timing: &SchedTimingToday,
+        candidates: Vec<DueCard>,
+        same_day: bool,
+    ) -> Result<Vec<RwkvDueCard>> {
         let decks = self.storage.get_decks_map()?;
         let configs = self.storage.get_deck_config_map()?;
         let target_for = |deck_id: DeckId| -> f32 {
@@ -908,7 +1064,7 @@ impl Collection {
             engine.answers_since_requery = 0;
         }
         let today = timing.days_elapsed as i64;
-        let day_start_ms = (timing.next_day_at.0 - 86_400) * 1000;
+        let day_start_ms = day_start_ms(timing);
         let end_of_day_ms = timing.next_day_at.0 * 1000 - 1;
         let now_ms = timing.now.0 * 1000;
 
@@ -928,6 +1084,9 @@ impl Collection {
                 continue;
             };
             if last.last_review_id >= day_start_ms {
+                if !same_day {
+                    continue;
+                }
                 let intervening = engine.replayed.rows.saturating_sub(last.last_index + 1);
                 let elapsed = (now_ms - last.last_review_id) / 1000;
                 if !same_day_guard_passes(intervening, elapsed) {

@@ -108,6 +108,20 @@ fn prepared(col: &mut Collection) -> bool {
     true
 }
 
+fn set_daily_list(col: &mut Collection, on: bool) {
+    col.set_config_json(DAILY_LIST_CONFIG_KEY, &on, false)
+        .unwrap();
+}
+
+fn due_ids(col: &mut Collection) -> Vec<CardId> {
+    col.rwkv_due_review_cards(false)
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .map(|c| c.card.id)
+        .collect()
+}
+
 fn scores(col: &mut Collection) -> Vec<(CardId, u32)> {
     col.rwkv_due_review_cards(false)
         .unwrap()
@@ -265,6 +279,93 @@ fn a_learning_card_that_falls_due_after_the_answer_waits_for_the_undone_card() {
 
     col.undo().unwrap();
     assert_eq!(col.get_next_card().unwrap().unwrap().card.id, shown);
+}
+
+/// With the daily list on, the first study fixes the day's reviews. Every
+/// answer moves the model, but it only takes the answered card off the list.
+#[test]
+fn the_daily_list_only_loses_the_cards_answered() {
+    let mut col = collection_with_history();
+    if !prepared(&mut col) {
+        return;
+    }
+    let following = due_ids(&mut col);
+    set_daily_list(&mut col, true);
+    let list = due_ids(&mut col);
+    // Before any answer today, the list is what the model predicts.
+    assert_eq!(list, following);
+    let answered = REQUERY_EVERY_ANSWERS as usize + 2;
+    assert!(list.len() > answered + 2, "fixture too small");
+    for card in &list[..answered] {
+        let next = col.get_next_card().unwrap().map(|q| q.card.id);
+        assert_eq!(next, Some(*card));
+        col.answer_good();
+    }
+    assert_eq!(due_ids(&mut col), list[answered..]);
+}
+
+/// Switching the daily list rebuilds study queues built under the other rule.
+#[test]
+fn switching_the_daily_list_rebuilds_the_queues() {
+    let mut col = collection_with_history();
+    if !prepared(&mut col) {
+        return;
+    }
+    let before = col.rwkv_epoch();
+    set_daily_list(&mut col, true);
+    assert_ne!(col.rwkv_epoch(), before);
+    set_daily_list(&mut col, false);
+    assert_eq!(col.rwkv_epoch(), before);
+}
+
+/// The day's list is kept beside the collection, so reopening it, as a
+/// phone does after the app was closed, keeps the cards fixed that morning.
+#[test]
+fn a_reopened_collection_keeps_the_daily_list() {
+    let Some(model) = weights() else {
+        println!("HAYAKI_RWKV_WEIGHTS_DIR not set; skipping");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("collection.anki2");
+    collection_with_history()
+        .storage
+        .db
+        .execute(&format!("vacuum into '{}'", path.display()), [])
+        .unwrap();
+    let open = |model: &LoadedModel| {
+        let mut col = crate::collection::CollectionBuilder::new(&path)
+            .build()
+            .unwrap();
+        col.rwkv_prepare(model.clone()).unwrap();
+        wait_ready(&col);
+        col
+    };
+    let mut col = crate::collection::CollectionBuilder::new(&path)
+        .build()
+        .unwrap();
+    set_switch(&mut col, true);
+    set_daily_list(&mut col, true);
+    col.rwkv_prepare(model.clone()).unwrap();
+    wait_ready(&col);
+    let list = due_ids(&mut col);
+    let answered = REQUERY_EVERY_ANSWERS as usize + 2;
+    assert!(list.len() > answered + 2, "fixture too small");
+    for card in &list[..answered] {
+        let next = col.get_next_card().unwrap().map(|q| q.card.id);
+        assert_eq!(next, Some(*card));
+        col.answer_good();
+    }
+    col.close(None).unwrap();
+
+    let mut col = open(&model);
+    assert_eq!(due_ids(&mut col), list[answered..]);
+
+    // Turning the list off and on again fixes a new one from the model now.
+    set_daily_list(&mut col, false);
+    let following = due_ids(&mut col);
+    set_daily_list(&mut col, true);
+    assert_eq!(due_ids(&mut col), following);
 }
 
 #[test]
