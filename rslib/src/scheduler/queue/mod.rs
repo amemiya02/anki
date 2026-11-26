@@ -20,6 +20,8 @@ pub(crate) use main::MainQueueEntry;
 pub(crate) use main::MainQueueEntryKind;
 
 use self::undo::QueueUpdate;
+use self::undo::RwkvAnswer;
+use self::undo::UndoableQueueChange;
 use super::states::SchedulingStates;
 use super::timing::SchedTimingToday;
 use crate::prelude::*;
@@ -210,6 +212,9 @@ impl Collection {
     pub(crate) fn maybe_clear_study_queues_after_op(&mut self, op: &OpChanges) {
         if op.op != Op::AnswerCard && op.requires_study_queue_rebuild() {
             self.state.card_queues = None;
+            // Hayaki: as upstream's undo entries, an undone RWKV answer only
+            // places the card in the queues rebuilt right after the undo.
+            self.state.rwkv_undone_answer = None;
         }
     }
 
@@ -241,6 +246,19 @@ impl Collection {
         Ok(())
     }
 
+    /// Hayaki: an answer changes every RWKV prediction, so queues the RWKV
+    /// rule built are rebuilt from the model instead of updated in place.
+    /// The undo entry lets undoing the answer show the card again.
+    pub(crate) fn drop_rwkv_queues_after_answering_card(&mut self, card: &Card) {
+        if let Some(queues) = self.state.card_queues.take() {
+            self.save_undo(UndoableQueueChange::RwkvCardAnswered(RwkvAnswer {
+                card_id: card.id,
+                day: queues.current_day,
+                learning_cutoff: queues.current_learning_cutoff,
+            }));
+        }
+    }
+
     /// Get the card queues, building if necessary.
     pub(crate) fn get_queues(&mut self) -> Result<&mut CardQueues> {
         let deck = self.get_current_deck()?;
@@ -252,7 +270,11 @@ impl Collection {
             }
         }
         if self.state.card_queues.is_none() {
-            self.state.card_queues = Some(self.build_queues(deck.id)?);
+            let mut queues = self.build_queues(deck.id)?;
+            if let Some(answer) = self.state.rwkv_undone_answer.take() {
+                queues.restore_rwkv_answer(answer);
+            }
+            self.state.card_queues = Some(queues);
         }
 
         Ok(self.state.card_queues.as_mut().unwrap())

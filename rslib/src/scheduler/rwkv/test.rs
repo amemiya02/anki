@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use super::*;
 use crate::card::CardType;
+use crate::deckconfig::ReviewMix;
 use crate::scheduler::queue::QueueEntryKind;
 
 fn weights_of(size: ModelSize) -> Option<LoadedModel> {
@@ -183,6 +184,87 @@ fn undo_restores_every_prediction() {
     // Redo appends the same review again and gives the same predictions.
     col.redo().unwrap();
     assert_eq!(scores(&mut col), after_answer);
+}
+
+/// Undoing an answer shows that card again, as upstream does, although the
+/// answer dropped the queues the RWKV rule built.
+#[test]
+fn undoing_an_answer_shows_the_card_again() {
+    let mut col = collection_with_history();
+    if !prepared(&mut col) {
+        return;
+    }
+    let shown = col.get_next_card().unwrap().unwrap().card.id;
+    let counts = col.counts();
+    assert_eq!(col.answer_good().card_id, shown);
+    let next = col.get_next_card().unwrap().unwrap().card.id;
+    assert_ne!(next, shown);
+
+    col.undo().unwrap();
+    assert_eq!(col.get_next_card().unwrap().unwrap().card.id, shown);
+    assert_eq!(col.counts(), counts);
+
+    col.redo().unwrap();
+    assert_eq!(col.get_next_card().unwrap().unwrap().card.id, next);
+}
+
+/// The undone card comes first even when the rebuilt queues would put
+/// another card ahead of it, as upstream's undo puts the card back on top.
+/// Here a new card, shown before reviews, arrives between answer and undo.
+#[test]
+fn the_undone_card_comes_before_a_card_that_arrived_meanwhile() {
+    let mut col = collection_with_history();
+    if !prepared(&mut col) {
+        return;
+    }
+    col.update_default_deck_config(|config| {
+        config.new_mix = ReviewMix::BeforeReviews as i32;
+    });
+    let shown = col.answer_good().card_id;
+    let mut new = col
+        .storage
+        .get_all_cards()
+        .into_iter()
+        .find(|c| c.id != shown)
+        .unwrap();
+    new.ctype = CardType::New;
+    new.queue = CardQueue::New;
+    new.due = 0;
+    col.storage.update_card(&new).unwrap();
+    assert_eq!(col.get_next_card().unwrap().unwrap().card.id, new.id);
+
+    col.undo().unwrap();
+    assert_eq!(col.get_next_card().unwrap().unwrap().card.id, shown);
+}
+
+/// A learning card that falls due between an answer and its undo still
+/// waits, as upstream's undo restores the learning cutoff of the answer.
+#[test]
+fn a_learning_card_that_falls_due_after_the_answer_waits_for_the_undone_card() {
+    let mut col = collection_with_history();
+    if !prepared(&mut col) {
+        return;
+    }
+    let shown = col.get_next_card().unwrap().unwrap().card.id;
+    let falls_due = TimestampSecs::now().adding_secs(1);
+    col.answer_good();
+    let mut learning = col
+        .storage
+        .get_all_cards()
+        .into_iter()
+        .find(|c| c.id != shown)
+        .unwrap();
+    learning.ctype = CardType::Relearn;
+    learning.queue = CardQueue::Learn;
+    learning.due = falls_due.0 as i32;
+    col.storage.update_card(&learning).unwrap();
+    while TimestampSecs::now() <= falls_due {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(col.get_next_card().unwrap().unwrap().card.id, learning.id);
+
+    col.undo().unwrap();
+    assert_eq!(col.get_next_card().unwrap().unwrap().card.id, shown);
 }
 
 #[test]

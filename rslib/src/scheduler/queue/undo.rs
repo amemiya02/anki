@@ -1,6 +1,7 @@
 // Copyright: Ankitects Pty Ltd and contributors
 // License: GNU AGPL, version 3 or later; http://www.gnu.org/licenses/agpl.html
 
+use super::CardQueues;
 use super::LearningQueueEntry;
 use super::QueueEntry;
 use crate::prelude::*;
@@ -9,6 +10,19 @@ use crate::prelude::*;
 pub(crate) enum UndoableQueueChange {
     CardAnswered(Box<QueueUpdate>),
     CardAnswerUndone(Box<QueueUpdate>),
+    /// Hayaki: an answer from queues the RWKV rule built, which dropped them.
+    RwkvCardAnswered(RwkvAnswer),
+    RwkvCardAnswerUndone(RwkvAnswer),
+}
+
+/// Hayaki: the card answered from queues the RWKV rule built, and their day
+/// and learning cutoff then. Undoing the answer rebuilds the queues with the
+/// card on top under that cutoff, as upstream's undo restores its queues.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RwkvAnswer {
+    pub card_id: CardId,
+    pub day: u32,
+    pub learning_cutoff: TimestampSecs,
 }
 
 #[derive(Debug)]
@@ -68,11 +82,56 @@ impl Collection {
 
                 Ok(())
             }
+            UndoableQueueChange::RwkvCardAnswered(answer) => {
+                self.clear_study_queues();
+                self.state.rwkv_undone_answer = Some(answer);
+                self.save_undo(UndoableQueueChange::RwkvCardAnswerUndone(answer));
+                Ok(())
+            }
+            UndoableQueueChange::RwkvCardAnswerUndone(answer) => {
+                self.clear_study_queues();
+                self.state.rwkv_undone_answer = None;
+                self.save_undo(UndoableQueueChange::RwkvCardAnswered(answer));
+                Ok(())
+            }
         }
     }
 
     pub(super) fn save_queue_update_undo(&mut self, change: Box<QueueUpdate>) {
         self.save_undo(UndoableQueueChange::CardAnswered(change))
+    }
+}
+
+impl CardQueues {
+    /// Hayaki: puts rebuilt queues as they were before an undone RWKV answer,
+    /// the card on top and learning cards that fell due since kept back. The
+    /// card stays out when the rebuilt queues no longer hold it, and nothing
+    /// is restored on another day.
+    pub(super) fn restore_rwkv_answer(&mut self, answer: RwkvAnswer) {
+        if answer.day != self.current_day {
+            return;
+        }
+        if answer.learning_cutoff < self.current_learning_cutoff {
+            let ahead = self
+                .current_learning_cutoff
+                .adding_secs(self.learn_ahead_secs);
+            let earlier_ahead = answer.learning_cutoff.adding_secs(self.learn_ahead_secs);
+            let not_yet_due = self
+                .intraday_learning
+                .iter()
+                .filter(|e| e.due > earlier_ahead && e.due <= ahead)
+                .count();
+            self.counts.learning = self.counts.learning.saturating_sub(not_yet_due);
+            self.current_learning_cutoff = answer.learning_cutoff;
+        }
+        let id = answer.card_id;
+        if let Some(pos) = self.intraday_learning.iter().position(|e| e.id == id) {
+            let entry = self.intraday_learning.remove(pos).unwrap();
+            self.intraday_learning.push_front(entry);
+        } else if let Some(pos) = self.main.iter().position(|e| e.id == id) {
+            let entry = self.main.remove(pos).unwrap();
+            self.main.push_front(entry);
+        }
     }
 }
 

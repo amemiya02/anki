@@ -377,9 +377,7 @@ impl Collection {
 
         // Handle queue updates based on from_queue flag
         if answer.from_queue && self.state.rwkv_built_queue {
-            // Hayaki: an answer changes every RWKV prediction, so the queue is
-            // rebuilt from the model instead of updated in place.
-            self.clear_study_queues();
+            self.drop_rwkv_queues_after_answering_card(&card);
         } else if answer.from_queue {
             self.update_queues_after_answering_card(
                 &card,

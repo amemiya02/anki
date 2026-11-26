@@ -144,6 +144,8 @@ pub struct CollectionState {
     pub(crate) rwkv_queue_epoch: u64,
     /// Whether the current study queues took their reviews from RWKV.
     pub(crate) rwkv_built_queue: bool,
+    /// The undone RWKV answer the next queue build restores.
+    pub(crate) rwkv_undone_answer: Option<crate::scheduler::queue::undo::RwkvAnswer>,
 }
 
 pub struct Collection {
